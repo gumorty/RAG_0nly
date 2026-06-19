@@ -1,0 +1,7 @@
+﻿Owner: Alice
+Progress: finished Java backend migration, Tika document parsing, strict chunking, and hybrid retrieval smoke test.
+Risk: production embedding service still needs enterprise model integration.
+Next: add calibrated reranker and richer evaluation dashboards.
+Decision: use Java Spring Boot API with PostgreSQL persistence for deployability.
+
+This weekly lab report describes a RAG knowledge base management system. It includes document ingestion, normalization, hierarchical chunking, quality warnings, sparse keyword terms, hash embeddings, grounded citations, knowledge gaps, and retrieval evaluation.

@@ -1,0 +1,5 @@
+﻿Owner: Alice
+Progress: finished Java Spring Boot backend, Apache Tika parsing, normalized chunking, quality analysis, and hybrid retrieval.
+Risk: enterprise deployment should later connect real embedding and reranker services.
+Next: build strategy evaluation dashboards and add tenant-level access control.
+Decision: use PostgreSQL persistence and Docker Compose for the first deployable system.

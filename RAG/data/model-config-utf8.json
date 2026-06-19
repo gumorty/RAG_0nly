@@ -1,0 +1,10 @@
+﻿{
+  "name": "DeepSeek 企业问答",
+  "provider": "deepseek",
+  "model_name": "deepseek-chat",
+  "base_url": "https://api.deepseek.com/v1",
+  "api_key": "test-key-not-real",
+  "temperature": 0.2,
+  "max_tokens": 1200,
+  "active": true
+}

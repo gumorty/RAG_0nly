@@ -1,0 +1,30 @@
+server:
+  port: ${API_PORT:8000}
+
+spring:
+  application:
+    name: enterprise-rag-api
+  datasource:
+    url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://localhost:5432/rag}
+    username: ${SPRING_DATASOURCE_USERNAME:rag}
+    password: ${SPRING_DATASOURCE_PASSWORD:rag_password}
+  jpa:
+    hibernate:
+      ddl-auto: update
+    open-in-view: false
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: UTC
+  servlet:
+    multipart:
+      max-file-size: 80MB
+      max-request-size: 120MB
+
+rag:
+  api-key: ${ADMIN_API_KEY:change-this-admin-api-key}
+  chunk-max-tokens: ${CHUNK_MAX_TOKENS:600}
+  chunk-overlap-tokens: ${CHUNK_OVERLAP_TOKENS:100}
+  final-top-k: ${RETRIEVAL_FINAL_TOP_K:8}
+  min-evidence-score: ${MIN_ANSWER_EVIDENCE_SCORE:0.15}
+  llm-model: ${LLM_MODEL:java-hash-rag}

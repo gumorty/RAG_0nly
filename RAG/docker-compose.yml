@@ -22,6 +22,8 @@ services:
 
   qdrant:
     image: qdrant/qdrant:v1.12.5
+    profiles:
+      - legacy-local-rag
     volumes:
       - qdrant_data:/qdrant/storage
 
@@ -49,14 +51,14 @@ services:
         condition: service_healthy
       redis:
         condition: service_started
-      qdrant:
-        condition: service_started
       minio:
         condition: service_started
 
   worker:
     build:
       context: ./backend
+    profiles:
+      - legacy-local-rag
     command: celery -A app.workers.celery_app.celery_app worker -Q rag --loglevel=INFO
     env_file:
       - .env
@@ -77,7 +79,7 @@ services:
       NEXT_PUBLIC_API_BASE_URL: http://localhost:8010
       NEXT_PUBLIC_API_KEY: change-this-admin-api-key
     ports:
-      - "3110:3000"
+      - "4070:3000"
     depends_on:
       - api
 

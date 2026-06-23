@@ -16,6 +16,10 @@ export type DocumentItem = {
   project?: string | null;
   meeting_date?: string | null;
   tags: string[];
+  status_message?: string | null;
+  ragflow_progress?: number | null;
+  chunk_count?: number | null;
+  token_count?: number | null;
 };
 
 export type ImportBatch = {
@@ -65,6 +69,8 @@ export type Citation = {
   source_uri?: string | null;
   metadata: Record<string, unknown>;
   preview: string;
+  content?: string;
+  page?: string | number | null;
 };
 
 export type ChatResponse = {
@@ -74,6 +80,31 @@ export type ChatResponse = {
   citations: Citation[];
   evidence_score: number;
   model: string;
+};
+
+export type AnswerItem = {
+  id: string;
+  trace_id: string;
+  collection_id: string;
+  question: string;
+  answer: string;
+  citations: Citation[];
+  evidence_score: number;
+  model: string;
+  feedback?: string | null;
+  created_at: string;
+};
+
+export type ChatTurn = {
+  role: "user" | "assistant";
+  content: string;
+};
+
+export type StreamEvent = {
+  answer: string;
+  reference?: { chunks?: Citation[]; doc_aggs?: Array<Record<string, unknown>> };
+  final: boolean;
+  error?: string;
 };
 
 export type CollectionQuality = {

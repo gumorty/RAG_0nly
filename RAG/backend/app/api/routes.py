@@ -1,14 +1,18 @@
+import json
+import logging
 import uuid
 from collections import Counter
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.api.deps import can_read_acl, get_current_user, require_roles, write_audit
 from app.api.schemas import (
     AdminMetricsOut,
+    AnswerOut,
     AuditLogOut,
     CollectionCreate,
     CollectionOut,
@@ -52,6 +56,7 @@ from app.models.entities import (
     Chunk,
     Collection,
     Document,
+    DocumentStatus,
     EvalCase,
     ImportBatch,
     ModelConfig,
@@ -63,9 +68,14 @@ from app.models.entities import (
 from app.rag.evaluation import EvaluationService
 from app.rag.normalize import sha256_bytes
 from app.rag.schemas import ChatRequest, ChatResponse, RetrievalStrategy
+from app.ragflow.chunk_method import select_chunk_method
+from app.ragflow.client import RagFlowClient, RagFlowError
 from app.services.batch_ingest import read_zip_documents
+from app.services.document_normalize import normalize_for_ragflow
+from app.workers.ragflow_ingestion import start_background_monitor
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 @router.get("/health")
@@ -79,11 +89,11 @@ def register(payload: RegisterIn, db: Session = Depends(get_db)) -> TokenPairOut
     existing = db.scalar(select(User).where(User.email == payload.email))
     if existing:
         raise HTTPException(status_code=409, detail="该邮箱已经注册")
-    has_password_user = db.scalar(select(User).where(User.password_hash.is_not(None))) is not None
+    total_users = db.query(User).count()
     user = User(
         email=payload.email,
         name=payload.name,
-        role=UserRole.member if has_password_user else UserRole.admin,
+        role=UserRole.admin if total_users <= 1 else UserRole.member,
         api_key_hash=hash_api_key(generate_api_key()),
         password_hash=hash_password(payload.password),
         token_version=1,
@@ -124,7 +134,7 @@ def logout(current_user: User = Depends(get_current_user), db: Session = Depends
 @router.get("/model-configs", response_model=list[ModelConfigOut])
 def list_model_configs(
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_roles(UserRole.admin, UserRole.maintainer)),
+    current_user: User = Depends(get_current_user),
 ) -> list[ModelConfigOut]:
     models = db.scalars(select(ModelConfig).order_by(ModelConfig.created_at.desc())).all()
     return [_model_config_out(model) for model in models]
@@ -193,7 +203,7 @@ def delete_model_config(
 @router.get("/admin/metrics", response_model=AdminMetricsOut)
 def admin_metrics(
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_roles(UserRole.admin, UserRole.maintainer)),
+    current_user: User = Depends(get_current_user),
 ) -> AdminMetricsOut:
     collections = db.scalars(select(Collection)).all()
     documents = db.scalars(select(Document)).all()
@@ -258,7 +268,7 @@ def list_knowledge_gaps(
     collection_id: str | None = None,
     limit: int = 100,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_roles(UserRole.admin, UserRole.maintainer)),
+    current_user: User = Depends(get_current_user),
 ) -> list[KnowledgeGapOut]:
     stmt = select(Answer).order_by(Answer.created_at.desc()).limit(min(max(limit, 1), 500))
     if collection_id:
@@ -301,6 +311,53 @@ def answer_to_eval_case(
     return {"id": case.id, "status": "created"}
 
 
+def _build_ragflow_system_prompt() -> str:
+    return (
+        "You are an enterprise RAG knowledge-base assistant. "
+        "Answer strictly from the retrieved evidence. "
+        "Do not invent facts. "
+        "Add citation markers after key conclusions using the format [1]. "
+        "If evidence is insufficient, state exactly what is missing. "
+        "Use the conversation history only to resolve follow-up references; "
+        "do not treat history as factual evidence unless the retrieved evidence supports it."
+    )
+
+
+def _try_create_ragflow_chat(
+    rag_client: RagFlowClient,
+    dataset_id: str,
+    collection_name: str,
+    metadata: dict,
+    payload_metadata: dict | None = None,
+) -> None:
+    """Create a RAGFlow chat/dialog when enabled, without blocking dataset creation."""
+    settings = get_settings()
+    if not settings.ragflow_enable_chat_completions:
+        return
+    try:
+        rerank_id = (payload_metadata or {}).get("ragflow_reranker_model") or settings.ragflow_reranker_model
+        chat = rag_client.create_chat(
+            name=f"{collection_name}-chat",
+            dataset_ids=[dataset_id],
+            llm_id=settings.ragflow_chat_model,
+            top_n=6,
+            similarity_threshold=0.1,
+            vector_similarity_weight=0.3,
+            prompt_config={
+                "system": _build_ragflow_system_prompt(),
+                "quote": True,
+                "refine_multiturn": True,
+            },
+            rerank_id=rerank_id or "",
+        )
+        metadata["ragflow_chat_id"] = chat.get("id")
+        metadata["ragflow_chat_name"] = chat.get("name")
+        metadata.pop("ragflow_chat_warning", None)
+    except RagFlowError as exc:
+        logger.warning("RAGFlow chat creation skipped for dataset %s: %s", dataset_id, exc)
+        metadata["ragflow_chat_warning"] = str(exc)
+
+
 @router.post("/collections", response_model=CollectionOut)
 def create_collection(
     payload: CollectionCreate,
@@ -310,7 +367,33 @@ def create_collection(
     existing = db.scalar(select(Collection).where(Collection.name == payload.name))
     if existing:
         raise HTTPException(status_code=409, detail="Collection name already exists")
-    collection = Collection(name=payload.name, description=payload.description, metadata_=payload.metadata)
+    metadata = dict(payload.metadata or {})
+    if get_settings().ragflow_enabled:
+        try:
+            settings = get_settings()
+            rag_client = RagFlowClient()
+            dataset = rag_client.create_dataset(
+                payload.name,
+                payload.description,
+                parser_config=payload.metadata.get("parser_config") if payload.metadata else None,
+            )
+            metadata["ragflow_dataset_id"] = dataset.get("id")
+            metadata["ragflow_dataset_name"] = dataset.get("name")
+            _try_create_ragflow_chat(
+                rag_client,
+                str(dataset.get("id")),
+                payload.name,
+                metadata,
+                payload.metadata,
+            )
+
+            # Knowledge graph: if enabled in default settings or metadata
+            if payload.metadata and payload.metadata.get("enable_knowledge_graph"):
+                rag_client.enable_knowledge_graph(dataset.get("id"))
+                metadata["ragflow_kg_enabled"] = True
+        except RagFlowError as exc:
+            raise HTTPException(status_code=502, detail=f"RAGFlow dataset creation failed: {exc}") from exc
+    collection = Collection(name=payload.name, description=payload.description, metadata_=metadata)
     db.add(collection)
     write_audit(db, current_user, "collection.create", "collection", collection.id, {"name": payload.name})
     db.commit()
@@ -378,7 +461,7 @@ async def upload_document(
         {"filename": document.filename, "collection_id": collection_id, "project": project},
     )
     db.commit()
-    _schedule_ingestion(document.id)
+    _ingest_with_ragflow_or_local(db, collection, document, data, file.content_type)
     return _document_out(document)
 
 
@@ -434,7 +517,7 @@ async def ingest_url_document(
         {"url": payload.url, "collection_id": collection_id, "project": payload.project},
     )
     db.commit()
-    _schedule_ingestion(document.id)
+    _ingest_with_ragflow_or_local(db, collection, document, data, content_type)
     return _document_out(document)
 
 
@@ -478,7 +561,7 @@ async def ingest_zip_batch(
     duplicate_skips = []
     parsed_tags = [item.strip() for item in (tags or "").split(",") if item.strip()]
     parsed_acl = [item.strip() for item in (acl or current_user.id).split(",") if item.strip()]
-    pending_ingestion_ids: list[str] = []
+    pending_ingestions: list[tuple[Document, bytes, str | None]] = []
     for entry in result.entries:
         checksum = sha256_bytes(entry.data)
         existing = db.scalar(select(Document).where(Document.collection_id == collection_id, Document.checksum == checksum))
@@ -506,7 +589,7 @@ async def ingest_zip_batch(
         db.flush()
         batch_report["documents"].append({"filename": entry.filename, "document_id": document.id})
         imported += 1
-        pending_ingestion_ids.append(document.id)
+        pending_ingestions.append((document, entry.data, entry.content_type))
 
     batch.imported_items = imported
     batch.skipped_items += len(duplicate_skips)
@@ -521,8 +604,8 @@ async def ingest_zip_batch(
         {"collection_id": collection_id, "source_name": batch.source_name, "imported_items": imported},
     )
     db.commit()
-    for document_id in pending_ingestion_ids:
-        _schedule_ingestion(document_id)
+    for document, data, content_type in pending_ingestions:
+        _ingest_with_ragflow_or_local(db, collection, document, data, content_type)
     return _batch_out(batch)
 
 
@@ -532,15 +615,37 @@ def list_documents(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> list[DocumentOut]:
+    collection = db.scalar(select(Collection).where(Collection.id == collection_id))
+    if collection and get_settings().ragflow_enabled:
+        _sync_ragflow_document_statuses(db, collection)
     documents = db.scalars(select(Document).where(Document.collection_id == collection_id).order_by(Document.created_at.desc())).all()
     return [_document_out(document) for document in documents if can_read_acl(current_user, document.acl or [])]
+
+
+@router.get("/collections/{collection_id}/answers", response_model=list[AnswerOut])
+def list_collection_answers(
+    collection_id: str,
+    limit: int = 20,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> list[AnswerOut]:
+    collection = db.scalar(select(Collection).where(Collection.id == collection_id))
+    if not collection:
+        raise HTTPException(status_code=404, detail="Collection not found")
+    answers = db.scalars(
+        select(Answer)
+        .where(Answer.collection_id == collection_id)
+        .order_by(Answer.created_at.desc())
+        .limit(min(max(limit, 1), 100))
+    ).all()
+    return [_answer_out(answer) for answer in reversed(answers)]
 
 
 @router.get("/collections/{collection_id}/import-batches", response_model=list[ImportBatchOut])
 def list_import_batches(
     collection_id: str,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_roles(UserRole.admin, UserRole.maintainer)),
+    current_user: User = Depends(get_current_user),
 ) -> list[ImportBatchOut]:
     batches = db.scalars(
         select(ImportBatch).where(ImportBatch.collection_id == collection_id).order_by(ImportBatch.created_at.desc())
@@ -552,7 +657,7 @@ def list_import_batches(
 def collection_quality(
     collection_id: str,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_roles(UserRole.admin, UserRole.maintainer)),
+    current_user: User = Depends(get_current_user),
 ) -> CollectionQualityOut:
     documents = db.scalars(select(Document).where(Document.collection_id == collection_id)).all()
     warning_counts: Counter[str] = Counter()
@@ -653,10 +758,21 @@ def delete_document(
     document = db.scalar(select(Document).where(Document.id == document_id))
     if not document:
         raise HTTPException(status_code=404, detail="Document not found")
-    from app.rag.vector_store import VectorStore
+    collection = db.scalar(select(Collection).where(Collection.id == document.collection_id))
+    if collection and get_settings().ragflow_enabled:
+        dataset_id = (collection.metadata_ or {}).get("ragflow_dataset_id")
+        ragflow_doc_id = (document.metadata_ or {}).get("ragflow_document_id")
+        if dataset_id and ragflow_doc_id:
+            try:
+                RagFlowClient().delete_document(dataset_id, ragflow_doc_id)
+            except Exception:
+                pass
     from app.services.storage import ObjectStorage
 
-    VectorStore().delete_document(document.id)
+    if not get_settings().ragflow_enabled:
+        from app.rag.vector_store import VectorStore
+
+        VectorStore().delete_document(document.id)
     try:
         ObjectStorage().remove_object(document.object_key)
     except Exception:
@@ -686,7 +802,16 @@ def reindex_document(
         raise HTTPException(status_code=404, detail="Document not found")
     write_audit(db, current_user, "document.reindex", "document", document.id, {"collection_id": document.collection_id})
     db.commit()
-    _schedule_ingestion(document.id)
+    if get_settings().ragflow_enabled:
+        collection = db.scalar(select(Collection).where(Collection.id == document.collection_id))
+        dataset_id = (collection.metadata_ or {}).get("ragflow_dataset_id") if collection else None
+        ragflow_doc_id = (document.metadata_ or {}).get("ragflow_document_id") if document.metadata_ else None
+        if dataset_id and ragflow_doc_id:
+            RagFlowClient().parse_documents(dataset_id, [ragflow_doc_id])
+            document.status = DocumentStatus.parsing
+            db.commit()
+    else:
+        _schedule_ingestion(document.id)
     return _document_out(document)
 
 
@@ -706,6 +831,29 @@ def chat(
         return ChatService(db).ask(payload)
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@router.post("/chat/stream")
+async def chat_stream(
+    payload: ChatRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """SSE-streaming chat endpoint.  Yields partial answer text as it arrives
+    from RAGFlow, then sends the final event with complete answer + citations."""
+    payload.user_id = current_user.id
+    payload.user_acl_principals = [current_user.id, current_user.email, current_user.role.value, "public"]
+    write_audit(db, current_user, "chat.stream", "collection", payload.collection_id, {"question_preview": payload.question[:160]})
+    db.commit()
+
+    from app.services.chat import ChatService
+
+    async def event_generator():
+        for event in ChatService(db).ask_stream(payload):
+            yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
 @router.post("/answers/{answer_id}/feedback")
@@ -858,6 +1006,7 @@ def get_trace(
 
 
 def _document_out(document: Document) -> DocumentOut:
+    analysis = (document.metadata_ or {}).get("analysis") or {}
     return DocumentOut(
         id=document.id,
         collection_id=document.collection_id,
@@ -869,11 +1018,49 @@ def _document_out(document: Document) -> DocumentOut:
         project=document.project,
         meeting_date=document.meeting_date,
         tags=document.tags or [],
+        status_message=_document_status_message(document, analysis),
+        ragflow_progress=float(analysis.get("progress") or 0),
+        chunk_count=int(analysis.get("chunk_count") or 0),
+        token_count=int(analysis.get("token_count") or 0),
+    )
+
+
+def _answer_out(answer: Answer) -> AnswerOut:
+    return AnswerOut(
+        id=answer.id,
+        trace_id=answer.trace_id,
+        collection_id=answer.collection_id,
+        question=answer.question,
+        answer=answer.answer,
+        citations=answer.citations or [],
+        model=answer.model,
+        evidence_score=answer.evidence_score,
+        feedback=answer.feedback,
+        created_at=answer.created_at.isoformat(),
     )
 
 
 def _status_value(document: Document) -> str:
     return document.status.value if hasattr(document.status, "value") else str(document.status)
+
+
+def _document_status_message(document: Document, analysis: dict) -> str:
+    status = _status_value(document)
+    if status == "ready":
+        chunks = int(analysis.get("chunk_count") or 0)
+        tokens = int(analysis.get("token_count") or 0)
+        if chunks:
+            return f"RAGFlow 已解析完成，生成 {chunks} 个分块，并写入向量索引。"
+        if tokens:
+            return f"RAGFlow 已解析完成，写入向量索引，约 {tokens} tokens。"
+        return "RAGFlow 已解析完成并写入向量索引。"
+    if status == "parsing":
+        progress = float(analysis.get("progress") or 0)
+        progress_msg = analysis.get("progress_msg") or "RAGFlow 正在解析、分块和构建索引。"
+        return f"{progress_msg}（{round(progress * 100)}%）"
+    if status == "failed":
+        return document.error_message or "RAGFlow 解析失败，请查看日志。"
+    return "文档已进入 RAGFlow 处理队列。"
 
 
 def _user_out(user: User) -> UserOut:
@@ -970,7 +1157,127 @@ def _prefix_items(document: Document, items: list[str]) -> list[str]:
     return [f"{prefix}: {item}" for item in items]
 
 
+def _ensure_ragflow_dataset(db: Session, collection: Collection) -> str:
+    metadata = dict(collection.metadata_ or {})
+    dataset_id = metadata.get("ragflow_dataset_id")
+    if dataset_id:
+        try:
+            RagFlowClient().get_dataset(str(dataset_id))
+            return str(dataset_id)
+        except RagFlowError:
+            pass
+    dataset = RagFlowClient().create_dataset(
+        name=f"{collection.name}",
+        description=collection.description,
+        parser_config=metadata.get("parser_config"),
+    )
+    metadata["ragflow_dataset_id"] = dataset.get("id")
+    metadata["ragflow_dataset_name"] = dataset.get("name")
+    collection.metadata_ = metadata
+    db.commit()
+    return str(metadata["ragflow_dataset_id"])
+
+
+def _ingest_with_ragflow_or_local(
+    db: Session,
+    collection: Collection,
+    document: Document,
+    data: bytes,
+    content_type: str | None,
+) -> None:
+    if not get_settings().ragflow_enabled:
+        _schedule_ingestion(document.id)
+        return
+    client = RagFlowClient()
+    try:
+        dataset_id = _ensure_ragflow_dataset(db, collection)
+        document.status = DocumentStatus.parsing
+        document.error_message = None
+        db.commit()
+        ragflow_filename, ragflow_data, ragflow_content_type, normalization = normalize_for_ragflow(
+            document.filename,
+            data,
+            content_type,
+        )
+        uploaded = client.upload_document(dataset_id, ragflow_filename, ragflow_data, ragflow_content_type)
+        ragflow_doc_id = str(uploaded.get("id"))
+        document.metadata_ = {
+            **(document.metadata_ or {}),
+            "ragflow_dataset_id": dataset_id,
+            "ragflow_document_id": ragflow_doc_id,
+            "ragflow_uploaded_filename": ragflow_filename,
+            "ragflow_content_type": ragflow_content_type,
+            **normalization,
+            "ragflow_document": uploaded,
+        }
+        db.commit()
+
+        # Override RAGFlow's chunk method per document type.
+        # PDF uses "paper" parser (layout + OCR), XLSX uses "table", etc.
+        from app.ragflow.chunk_method import select_chunk_method
+
+        chunk_method = select_chunk_method(ragflow_filename, ragflow_content_type)
+        client.update_document_parser(dataset_id, ragflow_doc_id, chunk_method=chunk_method)
+
+        client.parse_documents(dataset_id, [ragflow_doc_id])
+        start_background_monitor(document.id, dataset_id, ragflow_doc_id)
+    except Exception as exc:
+        db.rollback()
+        document = db.scalar(select(Document).where(Document.id == document.id))
+        if document:
+            document.status = DocumentStatus.failed
+            document.error_message = f"RAGFlow ingestion failed: {exc}"
+            db.commit()
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+def _sync_ragflow_document_statuses(db: Session, collection: Collection) -> None:
+    dataset_id = (collection.metadata_ or {}).get("ragflow_dataset_id")
+    if not dataset_id:
+        return
+    try:
+        remote_docs = RagFlowClient().list_documents(str(dataset_id))
+    except Exception:
+        return
+    by_id = {str(item.get("id")): item for item in remote_docs}
+    changed = False
+    documents = db.scalars(select(Document).where(Document.collection_id == collection.id)).all()
+    for document in documents:
+        ragflow_doc_id = (document.metadata_ or {}).get("ragflow_document_id")
+        remote = by_id.get(str(ragflow_doc_id))
+        if remote:
+            _apply_ragflow_document_status(document, remote)
+            changed = True
+    if changed:
+        db.commit()
+
+
+def _apply_ragflow_document_status(document: Document, remote: dict) -> None:
+    run = str(remote.get("run") or "").upper()
+    if run == "DONE":
+        document.status = DocumentStatus.ready
+        document.error_message = None
+    elif run in {"FAIL", "FAILED"}:
+        document.status = DocumentStatus.failed
+        document.error_message = str(remote.get("progress_msg") or "RAGFlow parsing failed")
+    else:
+        document.status = DocumentStatus.parsing
+    document.metadata_ = {
+        **(document.metadata_ or {}),
+        "ragflow_status": remote,
+        "analysis": {
+            **((document.metadata_ or {}).get("analysis") or {}),
+            "chunk_count": int(remote.get("chunk_count") or 0),
+            "token_count": int(remote.get("token_count") or 0),
+            "progress": float(remote.get("progress") or 0),
+            "progress_msg": remote.get("progress_msg") or "",
+        },
+    }
+
+
 def _schedule_ingestion(document_id: str) -> None:
+    if get_settings().ragflow_enabled:
+        return
     if get_settings().ingestion_mode == "sync":
         from app.core.db import SessionLocal
         from app.rag.pipeline import IngestionPipeline

@@ -42,12 +42,18 @@ class RetrievalStrategy(BaseModel):
     min_evidence_score: float = 0.22
 
 
+class ChatTurn(BaseModel):
+    role: str = Field(pattern="^(user|assistant)$")
+    content: str = Field(min_length=1, max_length=4000)
+
+
 class ChatRequest(BaseModel):
     collection_id: str
     question: str = Field(min_length=1, max_length=4000)
     user_id: str | None = None
     user_acl_principals: list[str] = Field(default_factory=list)
     strategy: RetrievalStrategy | None = None
+    history: list[ChatTurn] = Field(default_factory=list, max_length=12)
 
 
 class ChatResponse(BaseModel):

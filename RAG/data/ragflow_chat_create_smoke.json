@@ -1,0 +1,51 @@
+﻿{
+    "code":  0,
+    "data":  {
+                 "create_date":  "2026-06-19T22:54:44",
+                 "create_time":  1781880884764,
+                 "dataset_ids":  [
+                                     "71e039766bc711f19f96550afe29ac59"
+                                 ],
+                 "description":  "A helpful Assistant",
+                 "do_refer":  "1",
+                 "icon":  "",
+                 "id":  "cf306a706bee11f1815d09f6c41bcf04",
+                 "kb_names":  [
+                                  "LLMStart-WordFile-RAGFlow-OAI-20260619-181257"
+                              ],
+                 "language":  "English",
+                 "llm_id":  "qwen3.7-plus@default@OpenAI-API-Compatible",
+                 "llm_setting":  {
+                                     "max_tokens":  800,
+                                     "temperature":  0.2
+                                 },
+                 "meta_data_filter":  {
+
+                                      },
+                 "name":  "LLMStart smoke chat 225444",
+                 "prompt_config":  {
+                                       "empty_response":  "Sorry! No relevant content was found in the knowledge base!",
+                                       "parameters":  [
+
+                                                      ],
+                                       "prologue":  "Hi! I\u0027m your assistant. What can I do for you?",
+                                       "quote":  true,
+                                       "refine_multiturn":  true,
+                                       "system":  "??????????????????????????;??????,??????",
+                                       "tts":  false
+                                   },
+                 "prompt_type":  "simple",
+                 "rerank_id":  "",
+                 "similarity_threshold":  0.05,
+                 "status":  "1",
+                 "tenant_id":  "d7e0a6bc6bc611f19f96550afe29ac59",
+                 "tenant_llm_id":  null,
+                 "tenant_rerank_id":  null,
+                 "top_k":  1024,
+                 "top_n":  6,
+                 "update_date":  "2026-06-19T22:54:44",
+                 "update_time":  1781880884764,
+                 "vector_similarity_weight":  0.3
+             },
+    "message":  "success"
+}

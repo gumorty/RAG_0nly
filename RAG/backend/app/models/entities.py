@@ -96,6 +96,21 @@ class ImportBatch(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
+class RagflowSession(Base):
+    __tablename__ = "ragflow_sessions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    collection_id: Mapped[str] = mapped_column(String(36), index=True)
+    chat_id: Mapped[str] = mapped_column(String(200), index=True)
+    session_id: Mapped[str] = mapped_column(String(200), unique=True, index=True)
+    user_id: Mapped[str | None] = mapped_column(String(36), index=True)
+    turn_count: Mapped[int] = mapped_column(Integer, default=0)
+    title: Mapped[str | None] = mapped_column(String(500))
+    metadata_: Mapped[dict] = mapped_column("metadata", JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class Chunk(Base):
     __tablename__ = "chunks"
 

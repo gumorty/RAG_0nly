@@ -45,6 +45,20 @@ class Settings(BaseSettings):
     min_answer_evidence_score: float = Field(default=0.22, ge=0.0, le=1.0)
     ingestion_mode: str = Field(default="sync", pattern="^(sync|async)$")
 
+    ragflow_enabled: bool = True
+    ragflow_base_url: str = "http://host.docker.internal:9380/api/v1"
+    ragflow_api_key: str = "ragflow-llmstart-local-20260619"
+    ragflow_chat_model: str = "qwen3.7-plus@default@OpenAI-API-Compatible"
+    ragflow_embedding_model: str = "text-embedding-v4@default@OpenAI-API-Compatible"
+    ragflow_parse_timeout_seconds: int = Field(default=900, ge=30, le=7200)
+    ragflow_sync_interval_seconds: int = Field(default=120, ge=30, le=3600)
+    ragflow_enable_chat_completions: bool = False
+    ragflow_default_chunk_method: str = "naive"
+    ragflow_reranker_model: str = ""
+    ragflow_enable_agent: bool = False
+    ragflow_agent_template: str = "qa_agent"
+    ragflow_kg_enabled_default: bool = False
+
 
 @lru_cache
 def get_settings() -> Settings:

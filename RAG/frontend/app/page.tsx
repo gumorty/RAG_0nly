@@ -1,6 +1,6 @@
 "use client";
 
-import { ChangeEvent, FormEvent, useEffect, useMemo, useState } from "react";
+import { ChangeEvent, FormEvent, KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
   Archive,
@@ -34,6 +34,7 @@ import { api, auth } from "./api";
 import type {
   AdminMetrics,
   ChatResponse,
+  ChatTurn,
   Citation,
   Collection,
   CollectionQuality,
@@ -88,6 +89,33 @@ const quickQuestions = [
   "哪些问题没有足够证据，需要补充资料？"
 ];
 
+const modelPresets = [
+  {
+    name: "阿里云百炼 Qwen",
+    provider: "openai_compatible",
+    model_name: "qwen3.7-plus",
+    base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    temperature: "0.2",
+    max_tokens: "2000"
+  },
+  {
+    name: "DeepSeek Chat",
+    provider: "openai_compatible",
+    model_name: "deepseek-chat",
+    base_url: "https://api.deepseek.com/v1",
+    temperature: "0.2",
+    max_tokens: "2000"
+  },
+  {
+    name: "OpenAI Compatible",
+    provider: "openai_compatible",
+    model_name: "gpt-4.1-mini",
+    base_url: "https://api.openai.com/v1",
+    temperature: "0.2",
+    max_tokens: "2000"
+  }
+];
+
 export default function HomePage() {
   const [user, setUser] = useState<User | null>(null);
   const [authReady, setAuthReady] = useState(false);
@@ -109,10 +137,10 @@ export default function HomePage() {
   const [selectedZip, setSelectedZip] = useState<File | null>(null);
   const [question, setQuestion] = useState("");
   const [modelForm, setModelForm] = useState({
-    name: "DeepSeek Chat",
+    name: "阿里云百炼 Qwen",
     provider: "openai_compatible",
-    model_name: "deepseek-chat",
-    base_url: "https://api.deepseek.com/v1",
+    model_name: "qwen3.7-plus",
+    base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1",
     api_key: "",
     temperature: "0.2",
     max_tokens: "1600"
@@ -120,11 +148,14 @@ export default function HomePage() {
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+  const streamEndRef = useRef<HTMLDivElement | null>(null);
 
   const selectedCollection = useMemo(
     () => collections.find((collection) => collection.id === selectedId),
     [collections, selectedId]
   );
+  const selectedCollectionName = safeDisplayText(selectedCollection?.name, "选择一个知识库开始问答");
   const activeModel = models.find((model) => model.active) || models[0];
   const selectedGaps = gaps.filter((gap) => !selectedId || gap.collection_id === selectedId);
   const readyRatio = quality && quality.document_count > 0
@@ -152,8 +183,25 @@ export default function HomePage() {
   useEffect(() => {
     if (!user) return;
     setMessages([]);
-    loadWorkspace().catch((err) => setError(err instanceof Error ? err.message : "加载知识库详情失败"));
+    Promise.all([
+      loadWorkspace(),
+      loadConversation(selectedId)
+    ]).catch((err) => setError(err instanceof Error ? err.message : "加载知识库详情失败"));
   }, [selectedId, user]);
+
+  useEffect(() => {
+    streamEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+  }, [messages, busy]);
+
+  useEffect(() => {
+    if (!user || !selectedId) return;
+    const hasActiveDocuments = documents.some((document) => ["uploaded", "parsing"].includes(document.status));
+    if (!hasActiveDocuments) return;
+    const timer = window.setInterval(() => {
+      loadWorkspace(selectedId).catch(() => undefined);
+    }, 3000);
+    return () => window.clearInterval(timer);
+  }, [documents, selectedId, user]);
 
   async function loadCollections() {
     const [items, nextMetrics, nextGaps, nextModels] = await Promise.all([
@@ -187,6 +235,28 @@ export default function HomePage() {
     setQuality(nextQuality);
     setSummary(nextSummary);
     setBatches(nextBatches);
+  }
+
+  async function loadConversation(collectionId = selectedId) {
+    if (!collectionId) {
+      setMessages([]);
+      return;
+    }
+    const answers = await api.listAnswers(collectionId, 20).catch(() => []);
+    const restored: ChatMessage[] = [];
+    for (const answer of answers) {
+      restored.push({ id: `${answer.id}-question`, role: "user", content: answer.question });
+      restored.push({
+        id: answer.id,
+        role: "assistant",
+        content: answer.answer,
+        citations: answer.citations,
+        evidenceScore: answer.evidence_score,
+        model: answer.model,
+        answerId: answer.id
+      });
+    }
+    setMessages(restored);
   }
 
   async function onAuthenticated(nextUser: User) {
@@ -224,8 +294,9 @@ export default function HomePage() {
     if (!selectedId || !selectedFile) return;
     const form = buildUploadForm(selectedFile);
     await runAction(async () => {
-      await api.uploadDocument(selectedId, form);
+      const document = await api.uploadDocument(selectedId, form);
       setSelectedFile(null);
+      setNotice(document.status_message || `文档 ${document.filename} 已进入 RAGFlow 解析、Embedding 和索引流程。`);
       await refreshAfterIngest();
     }, "上传并索引失败");
   }
@@ -234,7 +305,7 @@ export default function HomePage() {
     event.preventDefault();
     if (!selectedId || !urlInput.trim()) return;
     await runAction(async () => {
-      await api.ingestUrl(selectedId, {
+      const document = await api.ingestUrl(selectedId, {
         url: urlInput.trim(),
         author: uploadMeta.author || null,
         project: uploadMeta.project || null,
@@ -242,6 +313,7 @@ export default function HomePage() {
         tags: parseTags(uploadMeta.tags)
       });
       setUrlInput("");
+      setNotice(document.status_message || "网页资料已进入 RAGFlow 解析、Embedding 和索引流程。");
       await refreshAfterIngest();
     }, "网页导入失败");
   }
@@ -253,6 +325,7 @@ export default function HomePage() {
     await runAction(async () => {
       await api.uploadZipBatch(selectedId, form);
       setSelectedZip(null);
+      setNotice("ZIP 批量导入已提交，文档会进入 RAGFlow 解析、Embedding 和索引流程。");
       await refreshAfterIngest();
     }, "ZIP 批量导入失败");
   }
@@ -261,18 +334,93 @@ export default function HomePage() {
     event?.preventDefault();
     const text = (preset || question).trim();
     if (!selectedId || !text) return;
-    setMessages((items) => [...items, { id: crypto.randomUUID(), role: "user", content: text }]);
+    const history = toChatHistory(messages);
+    const userMessage: ChatMessage = { id: crypto.randomUUID(), role: "user", content: text };
+    const assistantId = crypto.randomUUID();
+    setMessages((items) => [...items, userMessage]);
     setQuestion("");
-    await runAction(async () => {
-      const response = await api.chat({ collection_id: selectedId, question: text });
-      setMessages((items) => [...items, toAssistantMessage(response)]);
-      await Promise.all([
-        loadCollections(),
-        api.knowledgeGaps(selectedId).then((items) => {
-          setGaps((all) => [...all.filter((gap) => gap.collection_id !== selectedId), ...items]);
-        }).catch(() => undefined)
-      ]);
-    }, "问答检索失败");
+    setBusy(true);
+    setError("");
+
+    try {
+      const controller = api.chatStream(
+        { collection_id: selectedId, question: text, history },
+        (event) => {
+          if (event.answer) {
+            setMessages((items) => {
+              const updated = [...items];
+              const last = updated[updated.length - 1];
+              if (last && last.role === "assistant") {
+                last.content = mergeAssistantContent(last.content, event.answer);
+              } else {
+                updated.push({ id: assistantId, role: "assistant", content: event.answer });
+              }
+              return updated;
+            });
+          }
+          if (event.final && event.reference?.chunks) {
+            const ragCitations = event.reference.chunks.map(normalizeCitation);
+            setMessages((items) => {
+              const updated = [...items];
+              const last = updated[updated.length - 1];
+              if (last && last.role === "assistant") {
+                last.citations = ragCitations;
+                last.evidenceScore = ragCitations.length > 0
+                  ? Math.max(...ragCitations.map((c: { score: number }) => c.score))
+                  : 0;
+              } else {
+                updated.push({
+                  id: assistantId,
+                  role: "assistant",
+                  content: event.answer || "已完成检索，但没有生成可展示的回答。",
+                  citations: ragCitations,
+                  evidenceScore: ragCitations.length > 0 ? Math.max(...ragCitations.map((c: { score: number }) => c.score)) : 0
+                });
+              }
+              return updated;
+            });
+          }
+        },
+        () => {
+          setBusy(false);
+          refreshAfterChat();
+        },
+        (errMsg) => {
+          setMessages((items) => {
+            const updated = [...items];
+            const last = updated[updated.length - 1];
+            if (last && last.role === "assistant") {
+              last.content = errMsg;
+            }
+            return updated;
+          });
+          setBusy(false);
+        }
+      );
+      // Store controller for abort
+      (window as unknown as Record<string, unknown>).__chatAbort = controller;
+    } catch {
+      // fallback to non-streaming
+      try {
+        const response = await api.chat({ collection_id: selectedId, question: text, history });
+        setMessages((items) => [...items, toAssistantMessage(response)]);
+        await refreshAfterChat();
+      } catch (err) {
+        setError(err instanceof Error ? err.message : "问答检索失败");
+      } finally {
+        setBusy(false);
+      }
+    }
+  }
+
+  async function refreshAfterChat() {
+    await Promise.all([
+      loadCollections(),
+      loadWorkspace(),
+      api.knowledgeGaps(selectedId).then((items) => {
+        setGaps((all) => [...all.filter((gap) => gap.collection_id !== selectedId), ...items]);
+      }).catch(() => undefined)
+    ]);
   }
 
   async function createModel(event: FormEvent) {
@@ -290,6 +438,7 @@ export default function HomePage() {
       });
       setModels(await api.listModels());
       setModelForm({ ...modelForm, api_key: "" });
+      setNotice("模型配置已保存并启用。后续问答会使用新的 Chat 模型，RAGFlow 继续负责解析、向量化和检索。");
     }, "保存模型配置失败");
   }
 
@@ -297,6 +446,7 @@ export default function HomePage() {
     await runAction(async () => {
       await api.activateModel(modelId);
       setModels(await api.listModels());
+      setNotice("模型路由已切换。下一次问答会使用新的 Chat 模型。");
     }, "切换模型失败");
   }
 
@@ -339,6 +489,16 @@ export default function HomePage() {
     return form;
   }
 
+  function applyModelPreset(preset: (typeof modelPresets)[number]) {
+    setModelForm({ ...modelForm, ...preset });
+  }
+
+  function submitOnEnter(event: KeyboardEvent<HTMLTextAreaElement>) {
+    if (event.key !== "Enter" || event.shiftKey || event.nativeEvent.isComposing) return;
+    event.preventDefault();
+    void ask();
+  }
+
   if (!authReady || loading) {
     return <main className="authShell"><div className="loadingLine"><Loader2 size={16} /> 正在加载...</div></main>;
   }
@@ -354,7 +514,7 @@ export default function HomePage() {
           <img src="/rag.png" alt="RAG 知识中枢 Logo" className="brandLogo" />
           <div>
             <strong>RAG 知识中枢</strong>
-            <span>企业知识库问答工作台</span>
+            <span>RAGFlow 驱动的知识库问答</span>
           </div>
         </div>
 
@@ -376,7 +536,7 @@ export default function HomePage() {
           {collections.length === 0 && <div className="emptyHint">暂无知识库，请先创建。</div>}
           {collections.map((collection) => (
             <button className={collection.id === selectedId ? "collectionButton active" : "collectionButton"} key={collection.id} onClick={() => setSelectedId(collection.id)} type="button">
-              <Database size={16} /><span>{collection.name}</span><ChevronRight size={14} aria-hidden="true" />
+              <Database size={16} /><span>{safeDisplayText(collection.name, "未命名知识库")}</span><ChevronRight size={14} aria-hidden="true" />
             </button>
           ))}
         </nav>
@@ -390,6 +550,9 @@ export default function HomePage() {
           <details>
             <summary><SlidersHorizontal size={15} /> 管理模型配置</summary>
             <form className="modelForm compact" onSubmit={createModel}>
+              <div className="presetStrip">
+                {modelPresets.map((preset) => <button key={preset.name} type="button" onClick={() => applyModelPreset(preset)}>{preset.name}</button>)}
+              </div>
               <label><span>配置名称</span><input value={modelForm.name} onChange={(e) => setModelForm({ ...modelForm, name: e.target.value })} /></label>
               <label><span>供应商</span><input value={modelForm.provider} onChange={(e) => setModelForm({ ...modelForm, provider: e.target.value })} /></label>
               <label><span>模型名称</span><input value={modelForm.model_name} onChange={(e) => setModelForm({ ...modelForm, model_name: e.target.value })} /></label>
@@ -398,6 +561,7 @@ export default function HomePage() {
               <label><span>温度</span><input value={modelForm.temperature} onChange={(e) => setModelForm({ ...modelForm, temperature: e.target.value })} /></label>
               <label><span>最大 tokens</span><input value={modelForm.max_tokens} onChange={(e) => setModelForm({ ...modelForm, max_tokens: e.target.value })} /></label>
               <button className="primaryButton" type="submit" disabled={busy}><KeyRound size={16} /> 保存并启用</button>
+              <p className="modelHint">切换只影响 Chat 生成模型；文档解析、Embedding、索引和检索继续由 RAGFlow 负责。</p>
             </form>
             <div className="modelList">
               {models.map((model) => (
@@ -412,7 +576,7 @@ export default function HomePage() {
 
       <section className="chatWorkspace" aria-label="知识库问答区">
         <header className="chatHeader">
-          <div><p>知识库对话</p><h1>{selectedCollection?.name || "选择一个知识库开始问答"}</h1></div>
+          <div><p>知识库对话</p><h1>{selectedCollectionName}</h1></div>
           <div className="headerActions">
             <StatusPill icon={<ShieldCheck size={14} />} label={`可检索率 ${readyRatio}%`} />
             <StatusPill icon={<Layers3 size={14} />} label={`${quality?.total_chunks ?? 0} 个分块`} />
@@ -421,6 +585,7 @@ export default function HomePage() {
         </header>
 
         {error && <div className="errorBanner" role="alert">{error}</div>}
+        {notice && <div className="noticeBanner" role="status"><ShieldCheck size={16} /><span>{notice}</span><button type="button" onClick={() => setNotice("")}>知道了</button></div>}
 
         <div className="chatStream" aria-live="polite">
           {messages.length === 0 && (
@@ -438,13 +603,14 @@ export default function HomePage() {
                   {message.model && <span>{message.model}</span>}
                   {typeof message.evidenceScore === "number" && <span>证据分 {message.evidenceScore.toFixed(3)}</span>}
                 </div>
-                <p>{message.content}</p>
-                {message.citations?.length ? <div className="citationStack">{message.citations.map((citation, index) => <CitationCard citation={citation} index={index} key={`${message.id}-${citation.chunk_id}`} />)}</div> : null}
+                <FormattedAnswer content={message.content} />
+                {message.citations?.length ? <CitationList citations={message.citations} messageId={message.id} /> : null}
                 {message.answerId && <button className="textButton" type="button" onClick={() => createEvalCase(message.answerId!)} disabled={busy}>加入评估集</button>}
               </div>
             </article>
           ))}
           {busy && <div className="loadingLine"><Loader2 size={16} /> 正在处理...</div>}
+          <div ref={streamEndRef} />
         </div>
 
         <div className="quickPrompts" aria-label="快捷问题">
@@ -452,7 +618,7 @@ export default function HomePage() {
         </div>
 
         <form className="composer" onSubmit={(event) => ask(event)}>
-          <textarea value={question} onChange={(event) => setQuestion(event.target.value)} placeholder="输入问题，例如：本周完成了什么？风险有哪些？下一步计划是什么？" aria-label="向当前知识库提问" rows={3} />
+          <textarea value={question} onKeyDown={submitOnEnter} onChange={(event) => setQuestion(event.target.value)} placeholder="输入问题，例如：本周完成了什么？风险有哪些？下一步计划是什么？" aria-label="向当前知识库提问" rows={3} />
           <button className="sendButton" disabled={busy || !selectedId || !question.trim()} type="submit" aria-label="发送问题"><Send size={18} /></button>
         </form>
       </section>
@@ -483,7 +649,7 @@ export default function HomePage() {
           <div className="qualityGrid"><Metric label="文档" value={quality?.document_count ?? documents.length} /><Metric label="可检索" value={quality?.ready_count ?? 0} /><Metric label="失败" value={quality?.failed_count ?? 0} tone="warn" /></div>
           <div className="documentList">
             {documents.length === 0 && <div className="emptyHint">当前知识库还没有资料。</div>}
-            {documents.slice(0, 8).map((document) => <div className="documentRow" key={document.id}><FileText size={15} /><div><strong>{document.title}</strong><span>{document.project || "未归属项目"} · {statusLabels[document.status] || document.status}</span></div><button type="button" onClick={() => deleteDocument(document.id)} disabled={busy} aria-label={`删除 ${document.title}`}><Trash2 size={15} /></button></div>)}
+            {documents.slice(0, 8).map((document) => <DocumentRow document={document} busy={busy} onDelete={deleteDocument} key={document.id} />)}
           </div>
         </section>
 
@@ -491,7 +657,7 @@ export default function HomePage() {
           <PanelTitle icon={<AlertTriangle size={18} />} title="缺口与运营" meta="低证据回答会进入评估闭环" />
           <div className="qualityGrid"><Metric label="回答" value={metrics?.answer_count ?? 0} /><Metric label="低证据" value={metrics?.low_evidence_answer_count ?? 0} tone="warn" /><Metric label="缺口" value={selectedGaps.length} tone="warn" /></div>
           <div className="gapList">
-            {selectedGaps.slice(0, 4).map((gap) => <article className="gapItem" key={gap.id}><div><strong>{gapReasonLabels[gap.reason] || gap.reason}</strong><span>{gap.evidence_score.toFixed(3)}</span></div><p>{gap.question}</p></article>)}
+            {selectedGaps.slice(0, 4).map((gap) => <article className="gapItem" key={gap.id}><div><strong>{gapReasonLabels[gap.reason] || safeDisplayText(gap.reason, "未知原因")}</strong><span>{gap.evidence_score.toFixed(3)}</span></div><p>{safeDisplayText(gap.question, "问题文本不可读")}</p></article>)}
             {selectedGaps.length === 0 && <div className="emptyHint">暂无低证据缺口。</div>}
           </div>
           {batches.length > 0 && <div className="batchLog"><strong>最近导入</strong>{batches.slice(0, 3).map((batch) => <p key={batch.id}>{batch.source_name}: 成功 {batch.imported_items}，跳过 {batch.skipped_items}，失败 {batch.failed_items}</p>)}</div>}
@@ -515,9 +681,9 @@ export default function HomePage() {
 
 function AuthPage({ onAuthenticated }: { onAuthenticated: (user: User) => Promise<void> }) {
   const [mode, setMode] = useState<"login" | "register">("login");
-  const [email, setEmail] = useState("admin@example.com");
+  const [email, setEmail] = useState("");
   const [name, setName] = useState("RAG Admin");
-  const [password, setPassword] = useState("Admin@123456");
+  const [password, setPassword] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
 
@@ -540,15 +706,15 @@ function AuthPage({ onAuthenticated }: { onAuthenticated: (user: User) => Promis
   return (
     <main className="authShell">
       <section className="authCard">
-        <div className="authLogo"><img src="/rag.png" alt="RAG 知识中枢 Logo" /><div><strong>RAG 知识中枢</strong><span>企业知识库问答工作台</span></div></div>
+        <div className="authLogo"><img src="/rag.png" alt="RAG 知识中枢 Logo" /><div><strong>RAG 知识中枢</strong><span>RAGFlow 驱动的企业知识库</span></div></div>
         <div><h1>{mode === "login" ? "登录系统" : "注册账号"}</h1><p>使用双 token 会话保护知识库、模型配置和导入数据。</p></div>
         <form className="authForm" onSubmit={submit}>
           {mode === "register" && <label><span>姓名</span><input value={name} onChange={(event) => setName(event.target.value)} required /></label>}
-          <label><span>邮箱</span><input type="email" value={email} onChange={(event) => setEmail(event.target.value)} required /></label>
-          <label><span>密码</span><input type="password" value={password} onChange={(event) => setPassword(event.target.value)} required /></label>
+          <label><span>邮箱</span><input type="email" value={email} onChange={(event) => setEmail(event.target.value)} placeholder="admin@example.com" required /></label>
+          <label><span>密码</span><input type="password" value={password} onChange={(event) => setPassword(event.target.value)} placeholder="请输入登录密码" required /></label>
           <p className="authHint">密码至少 10 位，包含大小写字母、数字和特殊字符。</p>
           {error && <div className="errorBanner">{error}</div>}
-          <button className="primaryButton" type="submit" disabled={busy}>{busy ? "处理中..." : mode === "login" ? "登录" : "注册并登录"}</button>
+          <button className="primaryButton" type="submit" disabled={busy}>{busy ? "处理中..." : mode === "login" ? "登录系统" : "注册并登录"}</button>
         </form>
         <button className="textButton" type="button" onClick={() => setMode(mode === "login" ? "register" : "login")}>{mode === "login" ? "没有账号？去注册" : "已有账号？去登录"}</button>
       </section>
@@ -572,6 +738,79 @@ function parseTags(value: string) {
   return value.split(",").map((tag) => tag.trim()).filter(Boolean);
 }
 
+function safeDisplayText(value: string | null | undefined, fallback: string) {
+  const text = (value || "").trim();
+  if (!text) return fallback;
+  if (/\?{2,}/.test(text)) return fallback;
+  return text;
+}
+
+function mergeAssistantContent(current: string, incoming: string) {
+  const next = incoming || "";
+  if (!next) return current;
+  if (!current) return next;
+  if (next.startsWith(current)) return next;
+  if (current.endsWith(next)) return current;
+  return `${current}${next}`;
+}
+
+function normalizeCitation(chunk: Citation | Record<string, unknown>): Citation {
+  const item = chunk as Record<string, unknown>;
+  const metadata = (item.metadata as Record<string, unknown> | undefined) || {};
+  const raw = (metadata.ragflow_chunk as Record<string, unknown> | undefined) || item;
+  const title = String(
+    item.title
+    || raw.docnm_kwd
+    || raw.document_keyword
+    || raw.document_name
+    || raw.filename
+    || "RAGFlow document"
+  );
+  const content = String(
+    item.content
+    || item.preview
+    || raw.content_with_weight
+    || raw.content
+    || raw.text
+    || ""
+  ).replace(/\s+/g, " ").trim();
+  const titlePath = Array.isArray(item.title_path) && item.title_path.length
+    ? item.title_path.map(String)
+    : [title];
+  return {
+    chunk_id: String(item.chunk_id || raw.chunk_id || raw.id || ""),
+    document_id: String(item.document_id || raw.doc_id || raw.document_id || ""),
+    title,
+    title_path: titlePath,
+    score: Number(item.score || raw.similarity || 0),
+    source_uri: (item.source_uri as string | null | undefined) || null,
+    metadata,
+    preview: String(item.preview || content).slice(0, 520),
+    content,
+    page: item.page as string | number | null | undefined
+  };
+}
+
+function citationText(citation: Citation) {
+  const raw = (citation.metadata?.ragflow_chunk || {}) as Record<string, unknown>;
+  const text = String(
+    citation.preview
+    || citation.content
+    || raw.content_with_weight
+    || raw.content
+    || raw.text
+    || ""
+  ).replace(/\s+/g, " ").trim();
+  return safeDisplayText(text, "未获得可读引用片段，请重新解析文档或检查 RAGFlow 返回字段。");
+}
+
+function toChatHistory(messages: ChatMessage[]): ChatTurn[] {
+  return messages
+    .filter((message) => message.content.trim())
+    .slice(-8)
+    .map((message) => ({ role: message.role, content: message.content.slice(0, 1800) }));
+}
+
 function SectionLabel({ children }: { children: React.ReactNode }) {
   return <div className="sectionLabel">{children}</div>;
 }
@@ -592,10 +831,58 @@ function EmptyConversation({ title, description }: { title: string; description:
   return <div className="emptyConversation"><div aria-hidden="true"><MessageSquareText size={28} /></div><h2>{title}</h2><p>{description}</p></div>;
 }
 
+function FormattedAnswer({ content }: { content: string }) {
+  const blocks = content.split(/\n{2,}/).map((block) => block.trim()).filter(Boolean);
+  if (!blocks.length) return <p className="answerParagraph">暂无回答内容。</p>;
+  return <div className="answerBlock">{blocks.map((block, blockIndex) => renderAnswerBlock(block, blockIndex))}</div>;
+}
+
+function renderAnswerBlock(block: string, blockIndex: number) {
+  const lines = block.split("\n").map((line) => line.trim()).filter(Boolean);
+  if (lines.length === 1 && /^#{1,4}\s+/.test(lines[0])) {
+    return <h3 className="answerHeading" key={blockIndex}>{renderInline(lines[0].replace(/^#{1,4}\s+/, ""))}</h3>;
+  }
+  if (lines.every((line) => /^([-*]|\d+[.)])\s+/.test(line))) {
+    return <ul className="answerList" key={blockIndex}>{lines.map((line, index) => <li key={index}>{renderInline(line.replace(/^([-*]|\d+[.)])\s+/, ""))}</li>)}</ul>;
+  }
+  return <p className="answerParagraph" key={blockIndex}>{renderInline(lines.map((line) => line.replace(/^#{1,4}\s+/, "")).join("\n"))}</p>;
+}
+
+function renderInline(text: string) {
+  return text.split(/(\*\*[^*]+\*\*)/g).map((part, index) => {
+    if (part.startsWith("**") && part.endsWith("**")) return <strong key={index}>{part.slice(2, -2)}</strong>;
+    return <span key={index}>{part}</span>;
+  });
+}
+
+function CitationList({ citations, messageId }: { citations: Citation[]; messageId: string }) {
+  const [expanded, setExpanded] = useState(false);
+  const visible = expanded ? citations : citations.slice(0, 3);
+  return <div className="citationStack"><div className="citationToolbar"><span>证据来源，默认显示前 {Math.min(3, citations.length)} 条</span>{citations.length > 3 && <button type="button" className="citationToggle" onClick={() => setExpanded(!expanded)}>{expanded ? "收起" : `展开全部 ${citations.length} 条`}</button>}</div>{visible.map((citation, index) => <CitationCard citation={citation} index={index} key={`${messageId}-${citation.chunk_id}-${index}`} />)}</div>;
+}
+
 function CitationCard({ citation, index }: { citation: Citation; index: number }) {
-  return <article className="citationCard"><div><strong>[{index + 1}] {citation.title}</strong><span>相关度 {citation.score.toFixed(3)}</span></div><p>{citation.preview}</p>{citation.title_path.length > 0 && <small>{citation.title_path.join(" / ")}</small>}</article>;
+  return <article className="citationCard"><div><strong>[{index + 1}] {safeDisplayText(citation.title, "未命名来源")}</strong><span>证据匹配度 {citation.score.toFixed(3)}</span></div><p>{citationText(citation)}</p>{citation.title_path.length > 0 && <small>{citation.title_path.map((item) => safeDisplayText(item, "未命名层级")).join(" / ")}{citation.page ? ` · 位置 ${citation.page}` : ""}</small>}</article>;
+}
+
+function DocumentRow({ document, busy, onDelete }: { document: DocumentItem; busy: boolean; onDelete: (id: string) => void }) {
+  const progress = Math.max(0, Math.min(100, Math.round((document.ragflow_progress || 0) * 100)));
+  const active = ["uploaded", "parsing"].includes(document.status);
+  return (
+    <div className="documentRow">
+      <FileText size={15} />
+      <div>
+        <strong>{safeDisplayText(document.title, "未命名文档")}</strong>
+        <span>{safeDisplayText(document.project, "未归属项目")}，{statusLabels[document.status] || document.status}{document.chunk_count ? `，${document.chunk_count} 个分块` : ""}</span>
+        {active && <div className="progressTrack" aria-label={`解析进度 ${progress}%`}><i style={{ width: `${progress}%` }} /></div>}
+        {document.status_message && <small>{safeDisplayText(document.status_message, "RAGFlow 状态不可读，请刷新。")}</small>}
+        {document.error_message && <small className="errorText">{safeDisplayText(document.error_message, "解析失败，错误信息不可读。")}</small>}
+      </div>
+      <button type="button" onClick={() => onDelete(document.id)} disabled={busy} aria-label={`删除 ${safeDisplayText(document.title, "未命名文档")}`}><Trash2 size={15} /></button>
+    </div>
+  );
 }
 
 function SummaryColumn({ title, items }: { title: string; items: string[] }) {
-  return <article className="summaryColumn"><strong>{title}</strong>{items.length ? items.slice(0, 8).map((item) => <p key={item}>{item}</p>) : <p>暂无从文档中抽取到的内容。</p>}</article>;
+  return <article className="summaryColumn"><strong>{title}</strong>{items.length ? items.slice(0, 8).map((item) => <p key={item}>{safeDisplayText(item, "该条摘要不可读，请重新解析文档。")}</p>) : <p>暂无从文档中抽取到的内容。</p>}</article>;
 }

@@ -33,6 +33,8 @@ async function request<T>(path: string, init?: RequestInit, retry = true): Promi
     ...init,
     headers,
     cache: "no-store"
+  }).catch((error) => {
+    throw new Error(`无法连接后端 API（${API_BASE}）。请确认 Docker 中 api 服务已启动并映射到 8010 端口。${error instanceof Error ? `原始错误：${error.message}` : ""}`);
   });
   if (response.status === 401 && retry && getRefreshToken()) {
     const refreshed = await refreshSession().catch(() => null);
@@ -51,6 +53,8 @@ async function authRequest<T>(path: string, payload: Record<string, unknown>): P
     headers: { "Content-Type": "application/json", "X-API-Key": API_KEY },
     body: JSON.stringify(payload),
     cache: "no-store"
+  }).catch((error) => {
+    throw new Error(`无法连接后端 API（${API_BASE}）。请确认 Docker 中 api 服务已启动并映射到 8010 端口。${error instanceof Error ? `原始错误：${error.message}` : ""}`);
   });
   if (!response.ok) {
     throw new Error(await readError(response));
@@ -122,6 +126,8 @@ export const api = {
       body: JSON.stringify({ ...payload, metadata: {} })
     }),
   listDocuments: (collectionId: string) => request<import("./types").DocumentItem[]>(`/collections/${collectionId}/documents`),
+  listAnswers: (collectionId: string, limit = 20) =>
+    request<import("./types").AnswerItem[]>(`/collections/${collectionId}/answers?limit=${limit}`),
   listImportBatches: (collectionId: string) => request<import("./types").ImportBatch[]>(`/collections/${collectionId}/import-batches`),
   collectionQuality: (collectionId: string) => request<import("./types").CollectionQuality>(`/collections/${collectionId}/quality`),
   meetingSummary: (collectionId: string, meetingDate?: string) =>
@@ -154,10 +160,79 @@ export const api = {
     request<{ status: string; document_id: string }>(`/documents/${documentId}`, {
       method: "DELETE"
     }),
-  chat: (payload: { collection_id: string; question: string }) =>
+  chat: (payload: { collection_id: string; question: string; history?: import("./types").ChatTurn[] }) =>
     request<import("./types").ChatResponse>("/chat", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload)
-    })
+    }),
+  chatStream: function(
+    payload: { collection_id: string; question: string; history?: import("./types").ChatTurn[] },
+    onEvent: (event: import("./types").StreamEvent) => void,
+    onDone: () => void,
+    onError: (error: string) => void,
+  ): AbortController {
+    const controller = new AbortController();
+    const headers = new Headers({ "Content-Type": "application/json", "X-API-Key": API_KEY });
+    const token = getAccessToken();
+    if (token) headers.set("Authorization", `Bearer ${token}`);
+
+    fetch(`${API_BASE}/api/chat/stream`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+      cache: "no-store"
+    }).then(async (response) => {
+      if (!response.ok) {
+        onError(await readError(response));
+        return;
+      }
+      const reader = response.body?.getReader();
+      if (!reader) {
+        onError("无法读取响应流");
+        return;
+      }
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let completed = false;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed || trimmed === "data: [DONE]") {
+            if (trimmed === "data: [DONE]" && !completed) {
+              completed = true;
+              onDone();
+            }
+            continue;
+          }
+          if (trimmed.startsWith("data: ")) {
+            try {
+              const event = JSON.parse(trimmed.slice(6));
+              onEvent(event);
+              if (event.final && !completed) {
+                completed = true;
+                onDone();
+              }
+            } catch {
+              // ignore parse errors
+            }
+          }
+        }
+      }
+      if (!completed) onDone();
+    }).catch((err) => {
+      if (err.name !== "AbortError") {
+        onError(err instanceof Error ? err.message : "流式请求失败");
+      }
+    });
+
+    return controller;
+  }
 };

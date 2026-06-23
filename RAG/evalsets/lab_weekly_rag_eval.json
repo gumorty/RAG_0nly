@@ -1,0 +1,30 @@
+{
+  "name": "实验室知识库周报基线评测",
+  "collection_name": "实验室知识库",
+  "description": "覆盖当前周报资料中的项目进展、实验问题、风险和下一步计划。用于验证 RAGFlow 检索、证据引用和回答质量。",
+  "min_citations": 2,
+  "min_evidence_score": 0.2,
+  "cases": [
+    {
+      "id": "lab-experiment-documents",
+      "question": "当前知识库里面有哪些文档里面的哪些内容提到了我的论文的实验方面？",
+      "must_include": ["顾建伟6-10周", "顾建伟6-17周", "小目标", "数据集", "误报"],
+      "must_not_include": ["引用片段不可读", "暂无从文档中抽取到的内容"],
+      "min_citations": 3
+    },
+    {
+      "id": "lab-risks-next-steps",
+      "question": "当前有哪些实验风险、阻塞和下一步计划？请按资料来源列出证据。",
+      "must_include": ["误报", "小目标", "hard negative", "再次训练"],
+      "must_not_include": ["编造", "引用片段不可读"],
+      "min_citations": 2
+    },
+    {
+      "id": "lab-progress-summary",
+      "question": "这个知识库里最近的项目进展是什么？请给出引用。",
+      "must_include": ["部署", "实验", "周报"],
+      "must_not_include": ["引用片段不可读"],
+      "min_citations": 2
+    }
+  ]
+}

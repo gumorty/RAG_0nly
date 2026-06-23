@@ -1,0 +1,18 @@
+{
+  "code": 0,
+  "data": {
+    "answer": "Sorry! No relevant content was found in the knowledge base!",
+    "audio_binary": null,
+    "chat_id": "e66cbea06bee11f1815d09f6c41bcf04",
+    "final": true,
+    "id": "e674d5fe6bee11f1815d09f6c41bcf04",
+    "prompt": "\n\n### Query:\n?????????????????????????",
+    "reference": {
+      "chunks": [],
+      "doc_aggs": [],
+      "total": 0
+    },
+    "session_id": "e67545fc6bee11f1815d09f6c41bcf04"
+  },
+  "message": "success"
+}

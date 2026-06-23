@@ -1,0 +1,401 @@
+﻿{
+    "code":  0,
+    "data":  {
+                 "docs":  [
+                              {
+                                  "chunk_count":  14,
+                                  "chunk_method":  "naive",
+                                  "create_date":  "2026-06-19T18:12:58",
+                                  "create_time":  1781863978192,
+                                  "created_by":  "d7e0a6bc6bc611f19f96550afe29ac59",
+                                  "dataset_id":  "71e039766bc711f19f96550afe29ac59",
+                                  "id":  "721445ae6bc711f19f96550afe29ac59",
+                                  "location":  "Engineering_Ethics_Sensor_Fusion_Paper.docx",
+                                  "meta_fields":  {
+
+                                                  },
+                                  "name":  "Engineering_Ethics_Sensor_Fusion_Paper.docx",
+                                  "nickname":  "RAG Admin",
+                                  "parser_config":  {
+                                                        "auto_keywords":  0,
+                                                        "auto_questions":  0,
+                                                        "children_delimiter":  "\n",
+                                                        "chunk_token_num":  512,
+                                                        "delimiter":  "\n!?;?;!?",
+                                                        "ext":  {
+
+                                                                },
+                                                        "filename_embd_weight":  0.1,
+                                                        "graphrag":  {
+                                                                         "batch_chunk_token_size":  4096,
+                                                                         "build_subgraph_min_timeout_seconds":  600,
+                                                                         "build_subgraph_timeout_per_chunk_seconds":  300,
+                                                                         "community":  false,
+                                                                         "community_timeout_seconds":  1800,
+                                                                         "entity_types":  [
+                                                                                              "organization",
+                                                                                              "person",
+                                                                                              "geo",
+                                                                                              "event",
+                                                                                              "category"
+                                                                                          ],
+                                                                         "lock_acquire_timeout_seconds":  600,
+                                                                         "merge_timeout_seconds":  180,
+                                                                         "method":  "light",
+                                                                         "resolution":  false,
+                                                                         "resolution_timeout_seconds":  1800,
+                                                                         "retry_attempts":  2,
+                                                                         "retry_backoff_max_seconds":  60.0,
+                                                                         "retry_backoff_seconds":  2.0,
+                                                                         "use_graphrag":  false
+                                                                     },
+                                                        "html4excel":  false,
+                                                        "image_context_size":  0,
+                                                        "layout_recognize":  "DeepDOC",
+                                                        "llm_id":  "qwen3.7-plus@default@OpenAI-API-Compatible",
+                                                        "pages":  null,
+                                                        "parent_child":  {
+                                                                             "children_delimiter":  "\n",
+                                                                             "use_parent_child":  true
+                                                                         },
+                                                        "raptor":  {
+                                                                       "auto_disable_for_structured_data":  true,
+                                                                       "clustering_method":  "gmm",
+                                                                       "ext":  {
+
+                                                                               },
+                                                                       "max_cluster":  64,
+                                                                       "max_token":  256,
+                                                                       "prompt":  "Please summarize the following paragraphs. Be careful with the numbers, do not make things up. Paragraphs as following:\n      {cluster_content}\nThe above is the content you need to summarize.",
+                                                                       "random_seed":  0,
+                                                                       "scope":  "file",
+                                                                       "threshold":  0.1,
+                                                                       "tree_builder":  "raptor",
+                                                                       "use_raptor":  false
+                                                                   },
+                                                        "table_column_mode":  null,
+                                                        "table_column_names":  null,
+                                                        "table_column_roles":  null,
+                                                        "table_context_size":  0,
+                                                        "tag_kb_ids":  [
+
+                                                                       ],
+                                                        "task_page_size":  null,
+                                                        "topn_tags":  1
+                                                    },
+                                  "pipeline_id":  null,
+                                  "pipeline_name":  null,
+                                  "process_begin_at":  "2026-06-19T18:16:14",
+                                  "process_duration":  1097.72,
+                                  "progress":  1.0,
+                                  "progress_msg":  "\n18:34:21 Task has been received.\n18:34:21 Page(1~100000001): Start to parse.\n18:34:22 Page(1~100000001): Finish parsing.\n18:34:22 Page(1~100000001): Generate 14 chunks\n18:34:24 Page(1~100000001): Embedding chunks (1.79s)\n18:34:31 Page(1~100000001): Indexing done (7.66s).\n18:34:31 Page(1~100000001): Task done (10.07s)",
+                                  "run":  "DONE",
+                                  "size":  41039,
+                                  "source_type":  "local",
+                                  "status":  "1",
+                                  "suffix":  "docx",
+                                  "thumbnail":  "",
+                                  "token_count":  4137,
+                                  "type":  "doc",
+                                  "update_date":  "2026-06-19T18:34:31",
+                                  "update_time":  1781865271717
+                              },
+                              {
+                                  "chunk_count":  35,
+                                  "chunk_method":  "naive",
+                                  "create_date":  "2026-06-19T18:12:58",
+                                  "create_time":  1781863978165,
+                                  "created_by":  "d7e0a6bc6bc611f19f96550afe29ac59",
+                                  "dataset_id":  "71e039766bc711f19f96550afe29ac59",
+                                  "id":  "721045bc6bc711f19f96550afe29ac59",
+                                  "location":  "23407101白书华.docx",
+                                  "meta_fields":  {
+
+                                                  },
+                                  "name":  "23407101白书华.docx",
+                                  "nickname":  "RAG Admin",
+                                  "parser_config":  {
+                                                        "auto_keywords":  0,
+                                                        "auto_questions":  0,
+                                                        "children_delimiter":  "\n",
+                                                        "chunk_token_num":  512,
+                                                        "delimiter":  "\n!?;?;!?",
+                                                        "ext":  {
+
+                                                                },
+                                                        "filename_embd_weight":  0.1,
+                                                        "graphrag":  {
+                                                                         "batch_chunk_token_size":  4096,
+                                                                         "build_subgraph_min_timeout_seconds":  600,
+                                                                         "build_subgraph_timeout_per_chunk_seconds":  300,
+                                                                         "community":  false,
+                                                                         "community_timeout_seconds":  1800,
+                                                                         "entity_types":  [
+                                                                                              "organization",
+                                                                                              "person",
+                                                                                              "geo",
+                                                                                              "event",
+                                                                                              "category"
+                                                                                          ],
+                                                                         "lock_acquire_timeout_seconds":  600,
+                                                                         "merge_timeout_seconds":  180,
+                                                                         "method":  "light",
+                                                                         "resolution":  false,
+                                                                         "resolution_timeout_seconds":  1800,
+                                                                         "retry_attempts":  2,
+                                                                         "retry_backoff_max_seconds":  60.0,
+                                                                         "retry_backoff_seconds":  2.0,
+                                                                         "use_graphrag":  false
+                                                                     },
+                                                        "html4excel":  false,
+                                                        "image_context_size":  0,
+                                                        "layout_recognize":  "DeepDOC",
+                                                        "llm_id":  "qwen3.7-plus@default@OpenAI-API-Compatible",
+                                                        "pages":  null,
+                                                        "parent_child":  {
+                                                                             "children_delimiter":  "\n",
+                                                                             "use_parent_child":  true
+                                                                         },
+                                                        "raptor":  {
+                                                                       "auto_disable_for_structured_data":  true,
+                                                                       "clustering_method":  "gmm",
+                                                                       "ext":  {
+
+                                                                               },
+                                                                       "max_cluster":  64,
+                                                                       "max_token":  256,
+                                                                       "prompt":  "Please summarize the following paragraphs. Be careful with the numbers, do not make things up. Paragraphs as following:\n      {cluster_content}\nThe above is the content you need to summarize.",
+                                                                       "random_seed":  0,
+                                                                       "scope":  "file",
+                                                                       "threshold":  0.1,
+                                                                       "tree_builder":  "raptor",
+                                                                       "use_raptor":  false
+                                                                   },
+                                                        "table_column_mode":  null,
+                                                        "table_column_names":  null,
+                                                        "table_column_roles":  null,
+                                                        "table_context_size":  0,
+                                                        "tag_kb_ids":  [
+
+                                                                       ],
+                                                        "task_page_size":  null,
+                                                        "topn_tags":  1
+                                                    },
+                                  "pipeline_id":  null,
+                                  "pipeline_name":  null,
+                                  "process_begin_at":  "2026-06-19T18:16:14",
+                                  "process_duration":  1101.82,
+                                  "progress":  1.0,
+                                  "progress_msg":  "\n18:34:16 Task has been received.\n18:34:17 Page(1~100000001): Failed to chunk embed oleObject1.bin: file type not supported yet(pdf, xlsx, doc, docx, txt supported)\n18:34:17 Page(1~100000001): Start to parse.\n18:34:17 Page(1~100000001): Finish parsing.\n18:34:17 Page(1~100000001): Generate 37 chunks\n18:34:22 Page(1~100000001): Embedding chunks (4.12s)\n18:34:35 Page(1~100000001): Indexing done (13.77s).\n18:34:35 Page(1~100000001): Task done (18.79s)",
+                                  "run":  "DONE",
+                                  "size":  244583,
+                                  "source_type":  "local",
+                                  "status":  "1",
+                                  "suffix":  "docx",
+                                  "thumbnail":  "",
+                                  "token_count":  12437,
+                                  "type":  "doc",
+                                  "update_date":  "2026-06-19T18:34:35",
+                                  "update_time":  1781865275816
+                              },
+                              {
+                                  "chunk_count":  45,
+                                  "chunk_method":  "naive",
+                                  "create_date":  "2026-06-19T18:12:58",
+                                  "create_time":  1781863978135,
+                                  "created_by":  "d7e0a6bc6bc611f19f96550afe29ac59",
+                                  "dataset_id":  "71e039766bc711f19f96550afe29ac59",
+                                  "id":  "720ab55c6bc711f19f96550afe29ac59",
+                                  "location":  "111111(2).doc",
+                                  "meta_fields":  {
+
+                                                  },
+                                  "name":  "111111(2).doc",
+                                  "nickname":  "RAG Admin",
+                                  "parser_config":  {
+                                                        "auto_keywords":  0,
+                                                        "auto_questions":  0,
+                                                        "children_delimiter":  "\n",
+                                                        "chunk_token_num":  512,
+                                                        "delimiter":  "\n!?;?;!?",
+                                                        "ext":  {
+
+                                                                },
+                                                        "filename_embd_weight":  0.1,
+                                                        "graphrag":  {
+                                                                         "batch_chunk_token_size":  4096,
+                                                                         "build_subgraph_min_timeout_seconds":  600,
+                                                                         "build_subgraph_timeout_per_chunk_seconds":  300,
+                                                                         "community":  false,
+                                                                         "community_timeout_seconds":  1800,
+                                                                         "entity_types":  [
+                                                                                              "organization",
+                                                                                              "person",
+                                                                                              "geo",
+                                                                                              "event",
+                                                                                              "category"
+                                                                                          ],
+                                                                         "lock_acquire_timeout_seconds":  600,
+                                                                         "merge_timeout_seconds":  180,
+                                                                         "method":  "light",
+                                                                         "resolution":  false,
+                                                                         "resolution_timeout_seconds":  1800,
+                                                                         "retry_attempts":  2,
+                                                                         "retry_backoff_max_seconds":  60.0,
+                                                                         "retry_backoff_seconds":  2.0,
+                                                                         "use_graphrag":  false
+                                                                     },
+                                                        "html4excel":  false,
+                                                        "image_context_size":  0,
+                                                        "layout_recognize":  "DeepDOC",
+                                                        "llm_id":  "qwen3.7-plus@default@OpenAI-API-Compatible",
+                                                        "pages":  null,
+                                                        "parent_child":  {
+                                                                             "children_delimiter":  "\n",
+                                                                             "use_parent_child":  true
+                                                                         },
+                                                        "raptor":  {
+                                                                       "auto_disable_for_structured_data":  true,
+                                                                       "clustering_method":  "gmm",
+                                                                       "ext":  {
+
+                                                                               },
+                                                                       "max_cluster":  64,
+                                                                       "max_token":  256,
+                                                                       "prompt":  "Please summarize the following paragraphs. Be careful with the numbers, do not make things up. Paragraphs as following:\n      {cluster_content}\nThe above is the content you need to summarize.",
+                                                                       "random_seed":  0,
+                                                                       "scope":  "file",
+                                                                       "threshold":  0.1,
+                                                                       "tree_builder":  "raptor",
+                                                                       "use_raptor":  false
+                                                                   },
+                                                        "table_column_mode":  null,
+                                                        "table_column_names":  null,
+                                                        "table_column_roles":  null,
+                                                        "table_context_size":  0,
+                                                        "tag_kb_ids":  [
+
+                                                                       ],
+                                                        "task_page_size":  null,
+                                                        "topn_tags":  1
+                                                    },
+                                  "pipeline_id":  null,
+                                  "pipeline_name":  null,
+                                  "process_begin_at":  "2026-06-19T18:16:14",
+                                  "process_duration":  1110.99,
+                                  "progress":  1.0,
+                                  "progress_msg":  "\n18:34:21 Task has been received.\n18:34:22 Page(1~100000001): Failed to chunk embed c4d5a73c17.bin: file type not supported yet(pdf, xlsx, doc, docx, txt supported)\n18:34:22 Page(1~100000001): Failed to chunk embed fe3bd82950.bin: file type not supported yet(pdf, xlsx, doc, docx, txt supported)\n18:34:22 Page(1~100000001): Failed to chunk embed 3a8ec286ea.bin: file type not supported yet(pdf, xlsx, doc, docx, txt supported)\n18:34:22 Page(1~100000001): Failed to chunk embed 033f2ed30d.bin: file type not supported yet(pdf, xlsx, doc, docx, txt supported)\n18:34:22 Page(1~100000001): Failed to chunk embed 52c452b55f.bin: file type not supported yet(pdf, xlsx, doc, docx, txt supported)\n18:34:22 Page(1~100000001): Start to parse.\n18:34:28 Page(1~100000001): Finish parsing.\n18:34:28 Page(1~100000001): Generate 45 chunks\n18:34:32 Page(1~100000001): Embedding chunks (4.26s)\n18:34:44 Page(1~100000001): Indexing done (12.56s).\n18:34:44 Page(1~100000001): Task done (23.05s)",
+                                  "run":  "DONE",
+                                  "size":  1559552,
+                                  "source_type":  "local",
+                                  "status":  "1",
+                                  "suffix":  "doc",
+                                  "thumbnail":  "",
+                                  "token_count":  1213,
+                                  "type":  "doc",
+                                  "update_date":  "2026-06-19T18:34:44",
+                                  "update_time":  1781865284994
+                              },
+                              {
+                                  "chunk_count":  593,
+                                  "chunk_method":  "naive",
+                                  "create_date":  "2026-06-19T18:12:58",
+                                  "create_time":  1781863978102,
+                                  "created_by":  "d7e0a6bc6bc611f19f96550afe29ac59",
+                                  "dataset_id":  "71e039766bc711f19f96550afe29ac59",
+                                  "id":  "72068df66bc711f19f96550afe29ac59",
+                                  "location":  "1.txt",
+                                  "meta_fields":  {
+
+                                                  },
+                                  "name":  "1.txt",
+                                  "nickname":  "RAG Admin",
+                                  "parser_config":  {
+                                                        "auto_keywords":  0,
+                                                        "auto_questions":  0,
+                                                        "children_delimiter":  "\n",
+                                                        "chunk_token_num":  512,
+                                                        "delimiter":  "\n!?;?;!?",
+                                                        "ext":  {
+
+                                                                },
+                                                        "filename_embd_weight":  0.1,
+                                                        "graphrag":  {
+                                                                         "batch_chunk_token_size":  4096,
+                                                                         "build_subgraph_min_timeout_seconds":  600,
+                                                                         "build_subgraph_timeout_per_chunk_seconds":  300,
+                                                                         "community":  false,
+                                                                         "community_timeout_seconds":  1800,
+                                                                         "entity_types":  [
+                                                                                              "organization",
+                                                                                              "person",
+                                                                                              "geo",
+                                                                                              "event",
+                                                                                              "category"
+                                                                                          ],
+                                                                         "lock_acquire_timeout_seconds":  600,
+                                                                         "merge_timeout_seconds":  180,
+                                                                         "method":  "light",
+                                                                         "resolution":  false,
+                                                                         "resolution_timeout_seconds":  1800,
+                                                                         "retry_attempts":  2,
+                                                                         "retry_backoff_max_seconds":  60.0,
+                                                                         "retry_backoff_seconds":  2.0,
+                                                                         "use_graphrag":  false
+                                                                     },
+                                                        "html4excel":  false,
+                                                        "image_context_size":  0,
+                                                        "layout_recognize":  "DeepDOC",
+                                                        "llm_id":  "qwen3.7-plus@default@OpenAI-API-Compatible",
+                                                        "pages":  null,
+                                                        "parent_child":  {
+                                                                             "children_delimiter":  "\n",
+                                                                             "use_parent_child":  true
+                                                                         },
+                                                        "raptor":  {
+                                                                       "auto_disable_for_structured_data":  true,
+                                                                       "clustering_method":  "gmm",
+                                                                       "ext":  {
+
+                                                                               },
+                                                                       "max_cluster":  64,
+                                                                       "max_token":  256,
+                                                                       "prompt":  "Please summarize the following paragraphs. Be careful with the numbers, do not make things up. Paragraphs as following:\n      {cluster_content}\nThe above is the content you need to summarize.",
+                                                                       "random_seed":  0,
+                                                                       "scope":  "file",
+                                                                       "threshold":  0.1,
+                                                                       "tree_builder":  "raptor",
+                                                                       "use_raptor":  false
+                                                                   },
+                                                        "table_column_mode":  null,
+                                                        "table_column_names":  null,
+                                                        "table_column_roles":  null,
+                                                        "table_context_size":  0,
+                                                        "tag_kb_ids":  [
+
+                                                                       ],
+                                                        "task_page_size":  null,
+                                                        "topn_tags":  1
+                                                    },
+                                  "pipeline_id":  null,
+                                  "pipeline_name":  null,
+                                  "process_begin_at":  "2026-06-19T18:16:14",
+                                  "process_duration":  1322.46,
+                                  "progress":  1.0,
+                                  "progress_msg":  "\n18:34:21 Task has been received.\n18:34:21 Page(1~100000001): Start to parse.\n18:34:21 Page(1~100000001): Finish parsing.\n18:34:22 Page(1~100000001): Generate 773 chunks\n18:34:55 Page(1~100000001): Embedding chunks (33.81s)\n18:38:16 Page(1~100000001): Indexing done (200.55s).\n18:38:16 Page(1~100000001): Task done (235.14s)",
+                                  "run":  "DONE",
+                                  "size":  26319,
+                                  "source_type":  "local",
+                                  "status":  "1",
+                                  "suffix":  "txt",
+                                  "thumbnail":  "",
+                                  "token_count":  8242,
+                                  "type":  "doc",
+                                  "update_date":  "2026-06-19T18:38:16",
+                                  "update_time":  1781865496461
+                              }
+                          ],
+                 "total":  4
+             },
+    "message":  "success"
+}

@@ -63,6 +63,10 @@ class DocumentOut(BaseModel):
     project: str | None
     meeting_date: str | None
     tags: list[str]
+    status_message: str | None = None
+    ragflow_progress: float | None = None
+    chunk_count: int | None = None
+    token_count: int | None = None
 
 
 class ImportBatchOut(BaseModel):
@@ -117,6 +121,19 @@ class KnowledgeGapOut(BaseModel):
     evidence_score: float
     feedback: str | None
     citations: list[dict]
+    created_at: str
+
+
+class AnswerOut(BaseModel):
+    id: str
+    trace_id: str
+    collection_id: str
+    question: str
+    answer: str
+    citations: list[dict]
+    model: str
+    evidence_score: float
+    feedback: str | None
     created_at: str
 
 

@@ -70,7 +70,7 @@ class ChatService:
         )
 
     # ------------------------------------------------------------------
-    # RAGFlow dispatch: Agent → Chat Completions → retrieval-only fallback
+    # RAGFlow dispatch: use retrieval-only as primary path
     # ------------------------------------------------------------------
 
     def _ask_with_ragflow(self, request: ChatRequest) -> ChatResponse:
@@ -82,24 +82,30 @@ class ChatService:
         if not dataset_id:
             raise RuntimeError("This collection is not linked to a RAGFlow dataset yet.")
 
-        # Priority 1: Agent workflow path (for complex multi-step queries)
-        agent_id = (collection.metadata_ or {}).get("ragflow_agent_id")
-        if self.settings.ragflow_enable_agent and agent_id:
-            try:
-                return self._ask_with_ragflow_agent(request, collection, str(agent_id))
-            except (RagFlowError, ConnectionError, TimeoutError) as exc:
-                logger.warning("RAGFlow agent failed, falling back: %s", exc)
+        # Priority 1: retrieval-only — RAGFlow retrieves, our LLM answers.
+        # This gives the best answer quality because we control the prompt
+        # and evidence formatting.  Chat Completions delegates to RAGFlow's
+        # internal LLM which may have a suboptimal system prompt.
+        try:
+            return self._ask_with_ragflow_retrieval_only(request, collection, str(dataset_id))
+        except (RagFlowError, ConnectionError, TimeoutError) as exc:
+            logger.warning("RAGFlow retrieval-only failed, trying chat completions: %s", exc)
 
-        # Priority 2: Chat Completions (single call: retrieval + LLM + citations)
+        # Priority 2: Chat Completions (RAGFlow retrieves + its LLM answers)
         chat_id = (collection.metadata_ or {}).get("ragflow_chat_id")
-        if self.settings.ragflow_enable_chat_completions and chat_id:
-            try:
-                return self._ask_with_ragflow_chat(request, collection, str(chat_id))
-            except (RagFlowError, ConnectionError, TimeoutError) as exc:
-                logger.warning("RAGFlow chat completions failed, falling back: %s", exc)
+        if self.settings.ragflow_enable_chat_completions:
+            if not chat_id:
+                try:
+                    chat_id = self._ensure_ragflow_chat(collection)
+                except RagFlowError as exc:
+                    logger.warning("Could not create RAGFlow chat for collection %s: %s", collection.id, exc)
+            if chat_id:
+                try:
+                    return self._ask_with_ragflow_chat(request, collection, str(chat_id))
+                except (RagFlowError, ConnectionError, TimeoutError) as exc:
+                    logger.warning("RAGFlow chat completions also failed: %s", exc)
 
-        # Priority 3: Retrieval-only fallback (our LLM answers from RAGFlow chunks)
-        return self._ask_with_ragflow_retrieval_only(request, collection, str(dataset_id))
+        raise RuntimeError("All RAGFlow retrieval paths failed")
 
     # ------------------------------------------------------------------
     # Preferred: RAGFlow Chat Completions (retrieval + LLM + citations in one call)
@@ -119,10 +125,8 @@ class ChatService:
             user_id=request.user_id,
         )
 
-        messages: list[dict] = []
-        for turn in request.history:
-            messages.append({"role": turn.role, "content": turn.content})
-        messages.append({"role": "user", "content": request.question})
+        # Only send the current question — RAGFlow maintains session history server-side
+        messages = [{"role": "user", "content": request.question}]
 
         client = RagFlowClient()
         response = client.chat_completion(
@@ -273,32 +277,9 @@ class ChatService:
             yield {"error": "This collection is not linked to a RAGFlow dataset yet.", "final": True}
             return
 
-        # Try streaming via RAGFlow Chat Completions if configured
-        chat_id = (collection.metadata_ or {}).get("ragflow_chat_id")
-        if self.settings.ragflow_enable_chat_completions:
-            # If chat_id is missing (e.g. legacy collection), create one on the fly
-            if not chat_id:
-                try:
-                    client = RagFlowClient()
-                    chat = client.create_chat(
-                        name=f"{collection.name}-chat",
-                        dataset_ids=[str(dataset_id)],
-                        llm_id=self.settings.ragflow_chat_model,
-                        top_n=6,
-                        similarity_threshold=0.1,
-                        vector_similarity_weight=0.3,
-                    )
-                    chat_id = chat.get("id")
-                    collection.metadata_ = {**(collection.metadata_ or {}), "ragflow_chat_id": chat_id}
-                    self.db.commit()
-                except RagFlowError as exc:
-                    logger.warning("Could not create RAGFlow chat for streaming: %s", exc)
-                    chat_id = None
-
-            if chat_id:
-                return self._ask_stream_via_ragflow_chat(request, collection, str(chat_id), str(dataset_id))
-
-        # Fallback: use the non-streaming retrieval-only path and yield a single result
+        # Use retrieval-only — RAGFlow retrieves, we stream the answer.
+        # This gives better answer quality than Chat Completions because
+        # we control the prompt and evidence formatting.
         try:
             response = self._ask_with_ragflow_retrieval_only(request, collection, str(dataset_id))
             yield {
@@ -307,7 +288,20 @@ class ChatService:
                 "final": True,
             }
         except Exception as exc:
-            logger.error("RAGFlow streaming fallback error: %s", exc)
+            logger.error("RAGFlow streaming retrieval-only error: %s", exc)
+
+            # Fallback to Chat Completions streaming
+            chat_id = (collection.metadata_ or {}).get("ragflow_chat_id")
+            if self.settings.ragflow_enable_chat_completions:
+                if not chat_id:
+                    try:
+                        chat_id = self._ensure_ragflow_chat(collection)
+                    except RagFlowError as chat_exc:
+                        logger.warning("Could not create RAGFlow chat for streaming: %s", chat_exc)
+                if chat_id:
+                    yield from self._ask_stream_via_ragflow_chat(request, collection, str(chat_id), str(dataset_id))
+                    return
+
             yield {"error": str(exc), "final": True}
 
     def _ask_stream_via_ragflow_chat(
@@ -325,10 +319,8 @@ class ChatService:
             user_id=request.user_id,
         )
 
-        messages: list[dict] = []
-        for turn in request.history:
-            messages.append({"role": turn.role, "content": turn.content})
-        messages.append({"role": "user", "content": request.question})
+        # Only send the current question — RAGFlow maintains session history server-side
+        messages = [{"role": "user", "content": request.question}]
 
         client = RagFlowClient()
         final_answer = ""
@@ -349,48 +341,78 @@ class ChatService:
                 ref = event.get("reference")
                 if ref:
                     final_reference = ref
-                yield {
-                    "answer": chunk,
-                    "reference": ref or {},
-                    "final": event.get("final", False),
-                }
-                if event.get("final"):
-                    break
+                if not event.get("final"):
+                    yield {
+                        "answer": chunk,
+                        "reference": ref or {},
+                        "final": False,
+                    }
         except Exception as exc:
             logger.error("RAGFlow streaming error: %s", exc)
             yield {"answer": "", "reference": {}, "final": True, "error": str(exc)}
             return
 
-        # Store the complete answer & trace after streaming finishes
+        # If Chat Completions returned nothing and we have documents in the
+        # collection, fall back to the retrieval-only path (bypasses the
+        # chat completions dispatch to avoid recursion).
         ragflow_chunks = final_reference.get("chunks", []) or []
+        if not ragflow_chunks:
+            # Chat Completions retrieved no evidence — either our docs aren't
+            # linked to the RAGFlow session, or the chat's internal retrieval
+            # didn't find them.  Fall back to the direct retrieval API which
+            # works reliably regardless of session/document linkage.
+            try:
+                strategy = request.strategy or self._default_strategy()
+                logger.info("Chat Completions returned 0 chunks for collection %s — using retrieval-only", collection.id)
+                fallback_chunks, _ = client.retrieve(
+                    str(dataset_id),
+                    request.question,
+                    page_size=max(strategy.final_top_k, 6),
+                )
+                evidence_score = max((c.score for c in fallback_chunks), default=0.0)
+                min_score = strategy.min_evidence_score if hasattr(strategy, 'min_evidence_score') else 0.22
+                fallback_answer = _clean_answer_text(self.llm.answer(
+                    request.question, fallback_chunks,
+                    min_score,
+                    history=request.history,
+                ))
+                fallback_citations = [_citation_from_retrieved_chunk(c) for c in fallback_chunks]
+                # Persist the fallback answer so conversation history survives refresh
+                fallback_trace = RetrievalTrace(
+                    collection_id=request.collection_id,
+                    query=request.question,
+                    strategy={**strategy.model_dump(), "engine": "ragflow_stream_fallback"},
+                    candidates=fallback_citations,
+                    selected_context=fallback_citations,
+                )
+                self.db.add(fallback_trace)
+                self.db.flush()
+                fallback_entity = Answer(
+                    trace_id=fallback_trace.id,
+                    collection_id=request.collection_id,
+                    question=request.question,
+                    answer=fallback_answer,
+                    citations=fallback_citations,
+                    model=f"{self.model_name} via RAGFlow retrieval",
+                    evidence_score=evidence_score,
+                )
+                self.db.add(fallback_entity)
+                self.db.commit()
+                yield {"answer": fallback_answer, "reference": {"chunks": fallback_citations}, "final": True}
+            except Exception as exc:
+                logger.error("Retrieval-only fallback also failed: %s", exc)
+                yield {"answer": "当前知识库没有足够的证据回答这个问题。", "reference": {}, "final": True}
+            return
+
         citations = _map_ragflow_citations(ragflow_chunks)
         evidence_score = _compute_ragflow_evidence_score(ragflow_chunks)
 
-        trace = RetrievalTrace(
-            collection_id=request.collection_id,
-            query=request.question,
-            strategy={
-                "engine": "ragflow_chat_completions_stream",
-                "chat_id": chat_id,
-                "session_id": session_id,
-            },
-            candidates=citations,
-            selected_context=citations,
-        )
-        self.db.add(trace)
-        self.db.flush()
-
-        answer = Answer(
-            trace_id=trace.id,
-            collection_id=request.collection_id,
-            question=request.question,
-            answer=final_answer,
-            citations=citations,
-            model=f"{self.settings.ragflow_chat_model} via RAGFlow chat",
-            evidence_score=evidence_score,
-        )
-        self.db.add(answer)
-        self.db.commit()
+        # Yield the final answer content + signal
+        yield {
+            "answer": final_answer,
+            "reference": {"chunks": ragflow_chunks},
+            "final": True,
+        }
 
     # ------------------------------------------------------------------
     # Fallback: retrieval-only — RAGFlow retrieves, our LLM answers
@@ -542,6 +564,45 @@ class ChatService:
             temperature=model_config.temperature,
             max_tokens=model_config.max_tokens,
         )
+
+    def _ensure_ragflow_chat(self, collection: Collection) -> str | None:
+        """Create a RAGFlow chat for a legacy collection that lacks one, and
+        persist the resulting chat_id back to collection.metadata_.
+
+        Returns the chat_id string, or None on failure.
+        """
+        from app.ragflow.client import RagFlowClient, RagFlowError
+
+        dataset_id = (collection.metadata_ or {}).get("ragflow_dataset_id")
+        if not dataset_id:
+            return None
+
+        try:
+            client = RagFlowClient()
+            chat = client.create_chat(
+                name=f"{collection.name}-chat",
+                dataset_ids=[str(dataset_id)],
+                llm_id=self.settings.ragflow_chat_model,
+                top_n=6,
+                similarity_threshold=0.1,
+                vector_similarity_weight=0.3,
+                prompt_config={
+                    "system": "You are a helpful enterprise knowledge base assistant.",
+                    "quote": True,
+                    "refine_multiturn": True,
+                },
+            )
+            chat_id = chat.get("id")
+            if chat_id:
+                collection.metadata_ = {
+                    **(collection.metadata_ or {}),
+                    "ragflow_chat_id": chat_id,
+                    "ragflow_chat_name": chat.get("name"),
+                }
+                self.db.commit()
+            return chat_id
+        except RagFlowError:
+            return None
 
     def _default_strategy(self) -> RetrievalStrategy:
         preset = self.db.scalar(select(RagStrategyPreset).where(RagStrategyPreset.is_default.is_(True)))

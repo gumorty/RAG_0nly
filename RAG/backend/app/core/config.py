@@ -52,7 +52,7 @@ class Settings(BaseSettings):
     ragflow_embedding_model: str = "text-embedding-v4@default@OpenAI-API-Compatible"
     ragflow_parse_timeout_seconds: int = Field(default=900, ge=30, le=7200)
     ragflow_sync_interval_seconds: int = Field(default=120, ge=30, le=3600)
-    ragflow_enable_chat_completions: bool = False
+    ragflow_enable_chat_completions: bool = True
     ragflow_default_chunk_method: str = "naive"
     ragflow_reranker_model: str = ""
     ragflow_enable_agent: bool = False

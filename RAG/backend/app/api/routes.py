@@ -849,8 +849,14 @@ async def chat_stream(
     from app.services.chat import ChatService
 
     async def event_generator():
-        for event in ChatService(db).ask_stream(payload):
-            yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+        from app.core.db import SessionLocal
+
+        db_local = SessionLocal()
+        try:
+            for event in ChatService(db_local).ask_stream(payload):
+                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+        finally:
+            db_local.close()
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")

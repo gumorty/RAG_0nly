@@ -165,10 +165,14 @@ class EvaluationService:
                 "context_recall": metrics["context_recall"],
             })
 
-        # Auto-add RAGFlow baseline if there are eval cases
-        case_count = self.db.scalar(
-            select(EvalCase.id).where(EvalCase.collection_id == collection_id).limit(1)
-        )
+        # Auto-add RAGFlow baseline if there are eval cases. Some focused unit
+        # tests construct the service with __new__ and no db; keep that path
+        # limited to the explicitly provided strategies.
+        case_count = None
+        if hasattr(self, "db"):
+            case_count = self.db.scalar(
+                select(EvalCase.id).where(EvalCase.collection_id == collection_id).limit(1)
+            )
         if case_count is not None:
             ragflow_metrics = self.run_ragflow_retrieval_eval(collection_id)
             if "error" not in ragflow_metrics:

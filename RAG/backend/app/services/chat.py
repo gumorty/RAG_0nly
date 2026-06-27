@@ -1,5 +1,6 @@
 import logging
 import re
+from datetime import datetime
 from html import unescape
 from html.parser import HTMLParser
 from typing import Any, Generator
@@ -8,7 +9,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import select
 
 from app.core.config import get_settings
-from app.models.entities import Answer, Collection, Document, ModelConfig, RagStrategyPreset, RetrievalTrace
+from app.models.entities import Answer, Collection, Document, ModelConfig, RagStrategyPreset, RagflowSession, RetrievalTrace
 from app.rag.llm import LLMClient
 from app.rag.retrieval import RetrievalService
 from app.rag.schemas import ChatRequest, ChatResponse, ChatTurn, RetrievalStrategy
@@ -25,6 +26,22 @@ class ChatService:
         self.llm = self._llm_client(active_model)
         self.model_name = active_model.model_name if active_model else self.settings.llm_model
         self.retrieval = RetrievalService(db)
+
+    def _touch_session(self, request: ChatRequest, title: str | None = None) -> None:
+        if not request.session_id:
+            return
+        session = self.db.scalar(
+            select(RagflowSession).where(
+                RagflowSession.collection_id == request.collection_id,
+                RagflowSession.session_id == request.session_id,
+            )
+        )
+        if not session:
+            return
+        session.turn_count = int(session.turn_count or 0) + 1
+        if title and (not session.title or session.title == "新对话"):
+            session.title = title[:500]
+        session.updated_at = datetime.utcnow()
 
     def ask(self, request: ChatRequest) -> ChatResponse:
         if self.settings.ragflow_enabled:
@@ -63,6 +80,7 @@ class ChatService:
             evidence_score=evidence_score,
         )
         self.db.add(answer)
+        self._touch_session(request, request.question[:80])
         self.db.commit()
         return ChatResponse(
             answer_id=answer.id,
@@ -130,6 +148,7 @@ class ChatService:
         _, session_id = mgr.get_or_create_session(
             collection_id=request.collection_id,
             user_id=request.user_id,
+            session_id=request.session_id,
         )
 
         # Only send the current question — RAGFlow maintains session history server-side
@@ -178,6 +197,7 @@ class ChatService:
             evidence_score=evidence_score,
         )
         self.db.add(answer)
+        self._touch_session(request, request.question[:80])
         self.db.commit()
 
         return ChatResponse(
@@ -266,6 +286,7 @@ class ChatService:
             evidence_score=evidence_score,
         )
         self.db.add(answer)
+        self._touch_session(request, request.question[:80])
         self.db.commit()
 
         return ChatResponse(
@@ -330,6 +351,7 @@ class ChatService:
         _, session_id = mgr.get_or_create_session(
             collection_id=request.collection_id,
             user_id=request.user_id,
+            session_id=request.session_id,
         )
 
         # Only send the current question — RAGFlow maintains session history server-side
@@ -414,6 +436,7 @@ class ChatService:
                     evidence_score=evidence_score,
                 )
                 self.db.add(fallback_entity)
+                self._touch_session(request, request.question[:80])
                 self.db.commit()
                 yield {"answer": fallback_answer, "reference": {"chunks": fallback_citations}, "final": True}
             except Exception as exc:
@@ -487,6 +510,7 @@ class ChatService:
         )
         self.db.add(answer)
         collection.metadata_ = {**(collection.metadata_ or {}), "last_ragflow_retrieval": raw_retrieval}
+        self._touch_session(request, request.question[:80])
         self.db.commit()
         return ChatResponse(
             answer_id=answer.id,

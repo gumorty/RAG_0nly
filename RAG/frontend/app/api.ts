@@ -123,6 +123,20 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ ...payload, metadata: {} })
     }),
+  deleteCollection: (collectionId: string) =>
+    request<{ status: string; collection_id: string }>(`/collections/${collectionId}`, { method: "DELETE" }),
+  listChatSessions: (collectionId: string) =>
+    request<import("./types").ChatSession[]>(`/collections/${collectionId}/sessions`),
+  createChatSession: (collectionId: string, title?: string) =>
+    request<import("./types").ChatSession>(`/collections/${collectionId}/sessions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title })
+    }),
+  deleteChatSession: (collectionId: string, sessionId: string) =>
+    request<{ status: string; session_id: string }>(`/collections/${collectionId}/sessions/${encodeURIComponent(sessionId)}`, {
+      method: "DELETE"
+    }),
   listDocuments: (collectionId: string) => request<import("./types").DocumentItem[]>(`/collections/${collectionId}/documents`),
   listAnswers: (collectionId: string, limit = 500, sessionId?: string) =>
     request<import("./types").AnswerItem[]>(

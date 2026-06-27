@@ -97,8 +97,8 @@ class RagFlowClient:
         return self._request("PUT", f"/datasets/{dataset_id}", json=updates)["data"]
 
     def delete_dataset(self, dataset_id: str) -> None:
-        """DELETE /datasets/<dataset_id> — remove a dataset."""
-        self._request("DELETE", f"/datasets/{dataset_id}")
+        """DELETE /datasets — remove one dataset by id."""
+        self._request("DELETE", "/datasets", json={"ids": [dataset_id]})
 
     # ------------------------------------------------------------------
     # Document management
@@ -381,6 +381,12 @@ class RagFlowClient:
     def get_session(self, chat_id: str, session_id: str) -> dict:
         """GET /chats/<chat_id>/sessions/<session_id> — get session messages + references."""
         return self._request("GET", f"/chats/{chat_id}/sessions/{session_id}")["data"]
+
+    def delete_sessions(self, chat_id: str, session_ids: list[str]) -> None:
+        """DELETE /chats/<chat_id>/sessions — delete one or more chat sessions."""
+        if not session_ids:
+            return
+        self._request("DELETE", f"/chats/{chat_id}/sessions", json={"ids": session_ids})
 
     # ------------------------------------------------------------------
     # Chat completions  (Phase 2)

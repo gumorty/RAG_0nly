@@ -14,6 +14,19 @@ class CollectionOut(BaseModel):
     metadata: dict
 
 
+class ChatSessionCreate(BaseModel):
+    title: str | None = Field(default=None, max_length=500)
+
+
+class ChatSessionOut(BaseModel):
+    session_id: str
+    collection_id: str
+    title: str | None
+    turn_count: int
+    created_at: str
+    updated_at: str
+
+
 class UserCreate(BaseModel):
     email: EmailStr
     name: str = Field(min_length=1, max_length=200)

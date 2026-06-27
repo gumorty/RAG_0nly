@@ -5,6 +5,15 @@ export type Collection = {
   metadata: Record<string, unknown>;
 };
 
+export type ChatSession = {
+  session_id: string;
+  collection_id: string;
+  title?: string | null;
+  turn_count: number;
+  created_at: string;
+  updated_at: string;
+};
+
 export type DocumentItem = {
   id: string;
   collection_id: string;

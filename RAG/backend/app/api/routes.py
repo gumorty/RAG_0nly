@@ -16,6 +16,8 @@ from app.api.schemas import (
     AdminMetricsOut,
     AnswerOut,
     AuditLogOut,
+    ChatSessionCreate,
+    ChatSessionOut,
     CollectionCreate,
     CollectionOut,
     CollectionQualityOut,
@@ -62,6 +64,7 @@ from app.models.entities import (
     EvalCase,
     ImportBatch,
     ModelConfig,
+    RagflowSession,
     RagStrategyPreset,
     RetrievalTrace,
     User,
@@ -416,6 +419,123 @@ def list_collections(
     ]
 
 
+@router.delete("/collections/{collection_id}")
+def delete_collection(
+    collection_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_roles(UserRole.admin, UserRole.maintainer)),
+) -> dict:
+    collection = db.scalar(select(Collection).where(Collection.id == collection_id))
+    if not collection:
+        raise HTTPException(status_code=404, detail="Collection not found")
+
+    metadata = collection.metadata_ or {}
+    dataset_id = metadata.get("ragflow_dataset_id")
+    if get_settings().ragflow_enabled and dataset_id:
+        try:
+            RagFlowClient().delete_dataset(str(dataset_id))
+        except RagFlowError as exc:
+            if not _ragflow_missing_resource(str(exc)):
+                raise HTTPException(status_code=502, detail=f"RAGFlow dataset deletion failed: {exc}") from exc
+            logger.warning("RAGFlow dataset already missing during collection delete: dataset=%s", dataset_id)
+
+    from app.services.storage import ObjectStorage
+
+    storage = ObjectStorage()
+    documents = db.scalars(select(Document).where(Document.collection_id == collection_id)).all()
+    for document in documents:
+        try:
+            storage.remove_object(document.object_key)
+        except Exception:
+            logger.warning("Object storage cleanup skipped for %s", document.object_key, exc_info=True)
+
+    answers = db.scalars(select(Answer).where(Answer.collection_id == collection_id)).all()
+    trace_ids = [answer.trace_id for answer in answers if answer.trace_id]
+    db.query(Answer).filter(Answer.collection_id == collection_id).delete(synchronize_session=False)
+    if trace_ids:
+        db.query(RetrievalTrace).filter(RetrievalTrace.id.in_(trace_ids)).delete(synchronize_session=False)
+    db.query(EvalCase).filter(EvalCase.collection_id == collection_id).delete(synchronize_session=False)
+    db.query(ImportBatch).filter(ImportBatch.collection_id == collection_id).delete(synchronize_session=False)
+    db.query(RagflowSession).filter(RagflowSession.collection_id == collection_id).delete(synchronize_session=False)
+    db.query(Chunk).filter(Chunk.collection_id == collection_id).delete(synchronize_session=False)
+    db.query(Document).filter(Document.collection_id == collection_id).delete(synchronize_session=False)
+    write_audit(db, current_user, "collection.delete", "collection", collection_id, {"name": collection.name, "ragflow_dataset_id": dataset_id})
+    db.delete(collection)
+    db.commit()
+    return {"status": "deleted", "collection_id": collection_id}
+
+
+@router.get("/collections/{collection_id}/sessions", response_model=list[ChatSessionOut])
+def list_chat_sessions(
+    collection_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> list[ChatSessionOut]:
+    collection = db.scalar(select(Collection).where(Collection.id == collection_id))
+    if not collection:
+        raise HTTPException(status_code=404, detail="Collection not found")
+    stmt = select(RagflowSession).where(RagflowSession.collection_id == collection_id)
+    if current_user.role not in {UserRole.admin, UserRole.maintainer}:
+        stmt = stmt.where(RagflowSession.user_id == current_user.id)
+    sessions = db.scalars(stmt.order_by(RagflowSession.updated_at.desc())).all()
+    return [_chat_session_out(session) for session in sessions]
+
+
+@router.post("/collections/{collection_id}/sessions", response_model=ChatSessionOut)
+def create_chat_session(
+    collection_id: str,
+    payload: ChatSessionCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> ChatSessionOut:
+    collection = db.scalar(select(Collection).where(Collection.id == collection_id))
+    if not collection:
+        raise HTTPException(status_code=404, detail="Collection not found")
+    session = _create_local_chat_session(db, collection, current_user, payload.title)
+    write_audit(db, current_user, "chat_session.create", "collection", collection_id, {"session_id": session.session_id})
+    db.commit()
+    return _chat_session_out(session)
+
+
+@router.delete("/collections/{collection_id}/sessions/{session_id}")
+def delete_chat_session(
+    collection_id: str,
+    session_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> dict:
+    session = db.scalar(
+        select(RagflowSession).where(
+            RagflowSession.collection_id == collection_id,
+            RagflowSession.session_id == session_id,
+        )
+    )
+    if not session:
+        raise HTTPException(status_code=404, detail="Chat session not found")
+    if session.user_id != current_user.id and current_user.role not in {UserRole.admin, UserRole.maintainer}:
+        raise HTTPException(status_code=403, detail="No permission to delete this session")
+
+    remote_session_id = (session.metadata_ or {}).get("ragflow_remote_session_id")
+    if remote_session_id and session.chat_id:
+        try:
+            RagFlowClient().delete_sessions(session.chat_id, [str(remote_session_id)])
+        except RagFlowError as exc:
+            if not _ragflow_missing_resource(str(exc)):
+                logger.warning("RAGFlow remote session deletion failed: %s", exc)
+
+    answers = db.scalars(
+        select(Answer).where(Answer.collection_id == collection_id, Answer.session_id == session_id)
+    ).all()
+    trace_ids = [answer.trace_id for answer in answers if answer.trace_id]
+    db.query(Answer).filter(Answer.collection_id == collection_id, Answer.session_id == session_id).delete(synchronize_session=False)
+    if trace_ids:
+        db.query(RetrievalTrace).filter(RetrievalTrace.id.in_(trace_ids)).delete(synchronize_session=False)
+    write_audit(db, current_user, "chat_session.delete", "collection", collection_id, {"session_id": session_id})
+    db.delete(session)
+    db.commit()
+    return {"status": "deleted", "session_id": session_id}
+
+
 @router.post("/collections/{collection_id}/documents", response_model=DocumentOut)
 async def upload_document(
     collection_id: str,
@@ -643,7 +763,7 @@ def list_collection_answers(
         raise HTTPException(status_code=404, detail="Collection not found")
     stmt = select(Answer).where(Answer.collection_id == collection_id)
     if session_id:
-        stmt = stmt.where(or_(Answer.session_id == session_id, Answer.session_id.is_(None)))
+        stmt = stmt.where(Answer.session_id == session_id)
     if current_user.role not in {UserRole.admin, UserRole.maintainer}:
         stmt = stmt.where(Answer.user_id == current_user.id)
     answers = db.scalars(stmt.order_by(Answer.created_at.desc()).limit(min(max(limit, 1), 1000))).all()
@@ -836,7 +956,11 @@ def chat(
     current_user: User = Depends(get_current_user),
 ) -> ChatResponse:
     payload.user_id = current_user.id
-    payload.session_id = _chat_session_id(payload.session_id)
+    collection = db.scalar(select(Collection).where(Collection.id == payload.collection_id))
+    if not collection:
+        raise HTTPException(status_code=404, detail="Collection not found")
+    session = _ensure_local_chat_session(db, collection, current_user, payload.session_id)
+    payload.session_id = session.session_id
     payload.user_acl_principals = [current_user.id, current_user.email, current_user.role.value, "public"]
     write_audit(db, current_user, "chat.query", "collection", payload.collection_id, {"question_preview": payload.question[:160]})
     db.commit()
@@ -857,7 +981,11 @@ async def chat_stream(
     """SSE-streaming chat endpoint.  Yields partial answer text as it arrives
     from RAGFlow, then sends the final event with complete answer + citations."""
     payload.user_id = current_user.id
-    payload.session_id = _chat_session_id(payload.session_id)
+    collection = db.scalar(select(Collection).where(Collection.id == payload.collection_id))
+    if not collection:
+        raise HTTPException(status_code=404, detail="Collection not found")
+    session = _ensure_local_chat_session(db, collection, current_user, payload.session_id)
+    payload.session_id = session.session_id
     payload.user_acl_principals = [current_user.id, current_user.email, current_user.role.value, "public"]
     write_audit(db, current_user, "chat.stream", "collection", payload.collection_id, {"question_preview": payload.question[:160]})
     db.commit()
@@ -1061,6 +1189,59 @@ def _ragflow_document_belongs_to_dataset(client: RagFlowClient, dataset_id: str,
     except RagFlowError:
         return False
     return any(str(item.get("id") or "") == str(document_id) for item in documents)
+
+
+def _create_local_chat_session(
+    db: Session,
+    collection: Collection,
+    current_user: User,
+    title: str | None = None,
+    session_id: str | None = None,
+) -> RagflowSession:
+    safe_session_id = _chat_session_id(session_id)
+    session = RagflowSession(
+        collection_id=collection.id,
+        chat_id=str((collection.metadata_ or {}).get("ragflow_chat_id") or ""),
+        session_id=safe_session_id,
+        user_id=current_user.id,
+        turn_count=0,
+        title=(title or "新对话").strip()[:500],
+        metadata_={"kind": "management_chat_session"},
+    )
+    db.add(session)
+    db.flush()
+    return session
+
+
+def _ensure_local_chat_session(
+    db: Session,
+    collection: Collection,
+    current_user: User,
+    session_id: str | None,
+) -> RagflowSession:
+    safe_session_id = _chat_session_id(session_id)
+    session = db.scalar(
+        select(RagflowSession).where(
+            RagflowSession.collection_id == collection.id,
+            RagflowSession.session_id == safe_session_id,
+        )
+    )
+    if session:
+        if session.user_id != current_user.id and current_user.role not in {UserRole.admin, UserRole.maintainer}:
+            raise HTTPException(status_code=403, detail="No permission to use this chat session")
+        return session
+    return _create_local_chat_session(db, collection, current_user, title="新对话", session_id=safe_session_id)
+
+
+def _chat_session_out(session: RagflowSession) -> ChatSessionOut:
+    return ChatSessionOut(
+        session_id=session.session_id,
+        collection_id=session.collection_id,
+        title=session.title,
+        turn_count=session.turn_count,
+        created_at=session.created_at.isoformat(),
+        updated_at=session.updated_at.isoformat(),
+    )
 
 
 def _document_out(document: Document) -> DocumentOut:

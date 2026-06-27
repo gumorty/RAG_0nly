@@ -9,6 +9,8 @@ class Settings(BaseSettings):
 
     app_env: str = "development"
     app_secret: str = "change-me"
+    public_registration_enabled: bool = True
+    cors_allowed_origins: str = "http://localhost:4070,http://localhost:3010,http://localhost:3000"
     bootstrap_admin_email: str = "admin@example.com"
     bootstrap_admin_name: str = "RAG Admin"
     bootstrap_admin_api_key: str = "change-this-admin-api-key"
@@ -44,15 +46,18 @@ class Settings(BaseSettings):
     retrieval_final_top_k: int = Field(default=8, ge=1, le=50)
     min_answer_evidence_score: float = Field(default=0.22, ge=0.0, le=1.0)
     ingestion_mode: str = Field(default="sync", pattern="^(sync|async)$")
+    max_upload_size_mb: int = Field(default=100, ge=1, le=2048)
+    max_zip_upload_size_mb: int = Field(default=500, ge=1, le=4096)
+    allow_private_url_ingest: bool = False
 
     ragflow_enabled: bool = True
-    ragflow_base_url: str = "http://host.docker.internal:9380/api/v1"
+    ragflow_base_url: str = "http://ragflow-gpu:9380/api/v1"
     ragflow_api_key: str = "ragflow-llmstart-local-20260619"
     ragflow_chat_model: str = "qwen3.7-plus@default@OpenAI-API-Compatible"
     ragflow_embedding_model: str = "text-embedding-v4@default@OpenAI-API-Compatible"
     ragflow_parse_timeout_seconds: int = Field(default=900, ge=30, le=7200)
     ragflow_sync_interval_seconds: int = Field(default=120, ge=30, le=3600)
-    ragflow_enable_chat_completions: bool = False
+    ragflow_enable_chat_completions: bool = True
     ragflow_default_chunk_method: str = "naive"
     ragflow_reranker_model: str = ""
     ragflow_enable_agent: bool = False

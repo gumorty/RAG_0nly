@@ -128,6 +128,8 @@ class AnswerOut(BaseModel):
     id: str
     trace_id: str
     collection_id: str
+    user_id: str | None = None
+    session_id: str | None = None
     question: str
     answer: str
     citations: list[dict]

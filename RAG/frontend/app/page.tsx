@@ -116,6 +116,8 @@ const modelPresets = [
   }
 ];
 
+const SESSION_KEY_PREFIX = "rag_chat_session:";
+
 export default function HomePage() {
   const [user, setUser] = useState<User | null>(null);
   const [authReady, setAuthReady] = useState(false);
@@ -242,7 +244,7 @@ export default function HomePage() {
       setMessages([]);
       return;
     }
-    const answers = await api.listAnswers(collectionId, 20).catch(() => []);
+    const answers = await api.listAnswers(collectionId, 1000, getConversationSessionId(collectionId)).catch(() => []);
     const restored: ChatMessage[] = [];
     for (const answer of answers) {
       restored.push({ id: `${answer.id}-question`, role: "user", content: answer.question });
@@ -334,6 +336,7 @@ export default function HomePage() {
     event?.preventDefault();
     const text = (preset || question).trim();
     if (!selectedId || !text) return;
+    const sessionId = getConversationSessionId(selectedId);
     const history = toChatHistory(messages);
     const userMessage: ChatMessage = { id: crypto.randomUUID(), role: "user", content: text };
     const assistantId = crypto.randomUUID();
@@ -344,7 +347,7 @@ export default function HomePage() {
 
     try {
       const controller = api.chatStream(
-        { collection_id: selectedId, question: text, history },
+        { collection_id: selectedId, question: text, session_id: sessionId, history },
         (event) => {
           if (event.answer) {
             setMessages((items) => {
@@ -402,7 +405,7 @@ export default function HomePage() {
     } catch {
       // fallback to non-streaming
       try {
-        const response = await api.chat({ collection_id: selectedId, question: text, history });
+        const response = await api.chat({ collection_id: selectedId, question: text, session_id: sessionId, history });
         setMessages((items) => [...items, toAssistantMessage(response)]);
         await refreshAfterChat();
       } catch (err) {
@@ -809,6 +812,16 @@ function toChatHistory(messages: ChatMessage[]): ChatTurn[] {
     .filter((message) => message.content.trim())
     .slice(-8)
     .map((message) => ({ role: message.role, content: message.content.slice(0, 1800) }));
+}
+
+function getConversationSessionId(collectionId: string) {
+  if (typeof window === "undefined") return collectionId;
+  const key = `${SESSION_KEY_PREFIX}${collectionId}`;
+  const existing = window.localStorage.getItem(key);
+  if (existing) return existing;
+  const next = crypto.randomUUID();
+  window.localStorage.setItem(key, next);
+  return next;
 }
 
 function SectionLabel({ children }: { children: React.ReactNode }) {

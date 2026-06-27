@@ -76,6 +76,7 @@ export type Citation = {
 export type ChatResponse = {
   answer_id: string;
   trace_id: string;
+  session_id?: string | null;
   answer: string;
   citations: Citation[];
   evidence_score: number;
@@ -86,6 +87,8 @@ export type AnswerItem = {
   id: string;
   trace_id: string;
   collection_id: string;
+  user_id?: string | null;
+  session_id?: string | null;
   question: string;
   answer: string;
   citations: Citation[];
@@ -98,6 +101,13 @@ export type AnswerItem = {
 export type ChatTurn = {
   role: "user" | "assistant";
   content: string;
+};
+
+export type ChatPayload = {
+  collection_id: string;
+  question: string;
+  session_id?: string;
+  history?: ChatTurn[];
 };
 
 export type StreamEvent = {

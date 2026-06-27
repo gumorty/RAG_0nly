@@ -1,12 +1,14 @@
 import json
 import logging
+import re
 import uuid
 from collections import Counter
 from datetime import datetime
+from pathlib import PurePath
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app.api.deps import can_read_acl, get_current_user, require_roles, write_audit
@@ -90,10 +92,12 @@ def register(payload: RegisterIn, db: Session = Depends(get_db)) -> TokenPairOut
     if existing:
         raise HTTPException(status_code=409, detail="该邮箱已经注册")
     total_users = db.query(User).count()
+    if total_users > 0 and not get_settings().public_registration_enabled:
+        raise HTTPException(status_code=403, detail="当前系统未开放公开注册，请联系管理员创建账号")
     user = User(
         email=payload.email,
         name=payload.name,
-        role=UserRole.admin if total_users <= 1 else UserRole.member,
+        role=UserRole.admin if total_users == 0 else UserRole.member,
         api_key_hash=hash_api_key(generate_api_key()),
         password_hash=hash_password(payload.password),
         token_version=1,
@@ -428,19 +432,20 @@ async def upload_document(
     collection = db.scalar(select(Collection).where(Collection.id == collection_id))
     if not collection:
         raise HTTPException(status_code=404, detail="Collection not found")
-    data = await file.read()
+    filename = _safe_upload_filename(file.filename, "document")
+    data = await _read_upload_bytes(file, get_settings().max_upload_size_mb)
     checksum = sha256_bytes(data)
     existing = db.scalar(select(Document).where(Document.collection_id == collection_id, Document.checksum == checksum))
     if existing:
         return _document_out(existing)
-    object_key = f"{collection_id}/{uuid.uuid4()}-{file.filename}"
+    object_key = f"{collection_id}/{uuid.uuid4()}-{filename}"
     from app.services.storage import ObjectStorage
 
     ObjectStorage().put_bytes(object_key, data, file.content_type)
     document = Document(
         collection_id=collection_id,
-        title=file.filename or "untitled",
-        filename=file.filename or "untitled",
+        title=filename,
+        filename=filename,
         content_type=file.content_type,
         object_key=object_key,
         checksum=checksum,
@@ -450,6 +455,7 @@ async def upload_document(
         meeting_date=meeting_date,
         tags=[item.strip() for item in (tags or "").split(",") if item.strip()],
         acl=[item.strip() for item in (acl or current_user.id).split(",") if item.strip()],
+        metadata_={"ingest_source": "upload", "original_filename": file.filename or filename},
     )
     db.add(document)
     write_audit(
@@ -538,13 +544,14 @@ async def ingest_zip_batch(
         raise HTTPException(status_code=404, detail="Collection not found")
     if not (file.filename or "").lower().endswith(".zip"):
         raise HTTPException(status_code=400, detail="Only .zip batch imports are supported")
-    archive_data = await file.read()
+    archive_filename = _safe_upload_filename(file.filename, "batch.zip")
+    archive_data = await _read_upload_bytes(file, get_settings().max_zip_upload_size_mb)
     result = read_zip_documents(archive_data)
     batch_report = {"skipped": result.skipped, "failed": result.failed, "documents": []}
     batch = ImportBatch(
         collection_id=collection_id,
         source_type="zip",
-        source_name=file.filename or "batch.zip",
+        source_name=archive_filename,
         total_items=len(result.entries) + len(result.skipped) + len(result.failed),
         skipped_items=len(result.skipped),
         failed_items=len(result.failed),
@@ -563,31 +570,32 @@ async def ingest_zip_batch(
     parsed_acl = [item.strip() for item in (acl or current_user.id).split(",") if item.strip()]
     pending_ingestions: list[tuple[Document, bytes, str | None]] = []
     for entry in result.entries:
+        entry_filename = _safe_upload_filename(entry.filename, "document")
         checksum = sha256_bytes(entry.data)
         existing = db.scalar(select(Document).where(Document.collection_id == collection_id, Document.checksum == checksum))
         if existing:
-            duplicate_skips.append({"filename": entry.filename, "reason": "duplicate", "document_id": existing.id})
+            duplicate_skips.append({"filename": entry_filename, "reason": "duplicate", "document_id": existing.id})
             continue
-        object_key = f"{collection_id}/{uuid.uuid4()}-{entry.filename}"
+        object_key = f"{collection_id}/{uuid.uuid4()}-{entry_filename}"
         storage.put_bytes(object_key, entry.data, entry.content_type)
         document = Document(
             collection_id=collection_id,
-            title=entry.filename,
-            filename=entry.filename,
+            title=entry_filename,
+            filename=entry_filename,
             content_type=entry.content_type,
             object_key=object_key,
             checksum=checksum,
-            source_uri=f"zip://{file.filename}/{entry.filename}",
+            source_uri=f"zip://{archive_filename}/{entry_filename}",
             author=author,
             project=project,
             meeting_date=meeting_date,
             tags=parsed_tags,
             acl=parsed_acl,
-            metadata_={"ingest_source": "zip", "import_batch_id": batch.id},
+            metadata_={"ingest_source": "zip", "import_batch_id": batch.id, "original_filename": entry.filename},
         )
         db.add(document)
         db.flush()
-        batch_report["documents"].append({"filename": entry.filename, "document_id": document.id})
+        batch_report["documents"].append({"filename": entry_filename, "document_id": document.id})
         imported += 1
         pending_ingestions.append((document, entry.data, entry.content_type))
 
@@ -625,19 +633,20 @@ def list_documents(
 @router.get("/collections/{collection_id}/answers", response_model=list[AnswerOut])
 def list_collection_answers(
     collection_id: str,
-    limit: int = 20,
+    limit: int = 500,
+    session_id: str | None = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> list[AnswerOut]:
     collection = db.scalar(select(Collection).where(Collection.id == collection_id))
     if not collection:
         raise HTTPException(status_code=404, detail="Collection not found")
-    answers = db.scalars(
-        select(Answer)
-        .where(Answer.collection_id == collection_id)
-        .order_by(Answer.created_at.desc())
-        .limit(min(max(limit, 1), 100))
-    ).all()
+    stmt = select(Answer).where(Answer.collection_id == collection_id)
+    if session_id:
+        stmt = stmt.where(or_(Answer.session_id == session_id, Answer.session_id.is_(None)))
+    if current_user.role not in {UserRole.admin, UserRole.maintainer}:
+        stmt = stmt.where(Answer.user_id == current_user.id)
+    answers = db.scalars(stmt.order_by(Answer.created_at.desc()).limit(min(max(limit, 1), 1000))).all()
     return [_answer_out(answer) for answer in reversed(answers)]
 
 
@@ -765,8 +774,10 @@ def delete_document(
         if dataset_id and ragflow_doc_id:
             try:
                 RagFlowClient().delete_document(dataset_id, ragflow_doc_id)
-            except Exception:
-                pass
+            except RagFlowError as exc:
+                if not _ragflow_missing_resource(str(exc)):
+                    raise HTTPException(status_code=502, detail=f"RAGFlow document deletion failed: {exc}") from exc
+                logger.warning("RAGFlow document already missing during delete: dataset=%s document=%s", dataset_id, ragflow_doc_id)
     from app.services.storage import ObjectStorage
 
     if not get_settings().ragflow_enabled:
@@ -807,7 +818,10 @@ def reindex_document(
         dataset_id = (collection.metadata_ or {}).get("ragflow_dataset_id") if collection else None
         ragflow_doc_id = (document.metadata_ or {}).get("ragflow_document_id") if document.metadata_ else None
         if dataset_id and ragflow_doc_id:
-            RagFlowClient().parse_documents(dataset_id, [ragflow_doc_id])
+            client = RagFlowClient()
+            if not _ragflow_document_belongs_to_dataset(client, dataset_id, ragflow_doc_id):
+                raise HTTPException(status_code=409, detail="RAGFlow 文档不属于当前知识库，请删除后重新上传该文件")
+            client.parse_documents(dataset_id, [ragflow_doc_id])
             document.status = DocumentStatus.parsing
             db.commit()
     else:
@@ -822,6 +836,7 @@ def chat(
     current_user: User = Depends(get_current_user),
 ) -> ChatResponse:
     payload.user_id = current_user.id
+    payload.session_id = _chat_session_id(payload.session_id)
     payload.user_acl_principals = [current_user.id, current_user.email, current_user.role.value, "public"]
     write_audit(db, current_user, "chat.query", "collection", payload.collection_id, {"question_preview": payload.question[:160]})
     db.commit()
@@ -842,6 +857,7 @@ async def chat_stream(
     """SSE-streaming chat endpoint.  Yields partial answer text as it arrives
     from RAGFlow, then sends the final event with complete answer + citations."""
     payload.user_id = current_user.id
+    payload.session_id = _chat_session_id(payload.session_id)
     payload.user_acl_principals = [current_user.id, current_user.email, current_user.role.value, "public"]
     write_audit(db, current_user, "chat.stream", "collection", payload.collection_id, {"question_preview": payload.question[:160]})
     db.commit()
@@ -849,8 +865,14 @@ async def chat_stream(
     from app.services.chat import ChatService
 
     async def event_generator():
-        for event in ChatService(db).ask_stream(payload):
-            yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+        from app.core.db import SessionLocal
+
+        db_local = SessionLocal()
+        try:
+            for event in ChatService(db_local).ask_stream(payload):
+                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+        finally:
+            db_local.close()
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
@@ -1005,6 +1027,42 @@ def get_trace(
     }
 
 
+async def _read_upload_bytes(file: UploadFile, max_mb: int) -> bytes:
+    max_bytes = max_mb * 1024 * 1024
+    data = bytearray()
+    while True:
+        chunk = await file.read(1024 * 1024)
+        if not chunk:
+            break
+        data.extend(chunk)
+        if len(data) > max_bytes:
+            raise HTTPException(status_code=413, detail=f"文件超过大小限制：最大 {max_mb} MB")
+    return bytes(data)
+
+
+def _safe_upload_filename(filename: str | None, fallback: str) -> str:
+    name = PurePath(filename or fallback).name
+    name = re.sub(r"[^A-Za-z0-9._\-\u4e00-\u9fff]+", "-", name).strip(" ._-")
+    if not name:
+        name = fallback
+    if "." not in name and "." in fallback:
+        name = f"{name}{PurePath(fallback).suffix}"
+    return name[:180]
+
+
+def _ragflow_missing_resource(message: str) -> bool:
+    lowered = message.lower()
+    return any(token in lowered for token in ("not found", "does not exist", "doesn't exist", "404"))
+
+
+def _ragflow_document_belongs_to_dataset(client: RagFlowClient, dataset_id: str, document_id: str) -> bool:
+    try:
+        documents = client.list_documents(str(dataset_id))
+    except RagFlowError:
+        return False
+    return any(str(item.get("id") or "") == str(document_id) for item in documents)
+
+
 def _document_out(document: Document) -> DocumentOut:
     analysis = (document.metadata_ or {}).get("analysis") or {}
     return DocumentOut(
@@ -1030,6 +1088,8 @@ def _answer_out(answer: Answer) -> AnswerOut:
         id=answer.id,
         trace_id=answer.trace_id,
         collection_id=answer.collection_id,
+        user_id=answer.user_id,
+        session_id=answer.session_id,
         question=answer.question,
         answer=answer.answer,
         citations=answer.citations or [],
@@ -1038,6 +1098,13 @@ def _answer_out(answer: Answer) -> AnswerOut:
         feedback=answer.feedback,
         created_at=answer.created_at.isoformat(),
     )
+
+
+def _chat_session_id(value: str | None) -> str:
+    text = (value or "").strip()
+    if re.fullmatch(r"[A-Za-z0-9._:-]{8,80}", text):
+        return text
+    return str(uuid.uuid4())
 
 
 def _status_value(document: Document) -> str:
@@ -1200,7 +1267,13 @@ def _ingest_with_ragflow_or_local(
             content_type,
         )
         uploaded = client.upload_document(dataset_id, ragflow_filename, ragflow_data, ragflow_content_type)
-        ragflow_doc_id = str(uploaded.get("id"))
+        ragflow_doc_id = str(uploaded.get("id") or "")
+        if not ragflow_doc_id or not _ragflow_document_belongs_to_dataset(client, dataset_id, ragflow_doc_id):
+            ragflow_filename = f"{uuid.uuid4().hex[:8]}-{ragflow_filename}"
+            uploaded = client.upload_document(dataset_id, ragflow_filename, ragflow_data, ragflow_content_type)
+            ragflow_doc_id = str(uploaded.get("id") or "")
+        if not ragflow_doc_id or not _ragflow_document_belongs_to_dataset(client, dataset_id, ragflow_doc_id):
+            raise RagFlowError("RAGFlow uploaded document is not visible in the target dataset.")
         document.metadata_ = {
             **(document.metadata_ or {}),
             "ragflow_dataset_id": dataset_id,

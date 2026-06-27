@@ -8,7 +8,7 @@ from pathlib import PurePath
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app.api.deps import can_read_acl, get_current_user, require_roles, write_audit
@@ -633,19 +633,20 @@ def list_documents(
 @router.get("/collections/{collection_id}/answers", response_model=list[AnswerOut])
 def list_collection_answers(
     collection_id: str,
-    limit: int = 20,
+    limit: int = 500,
+    session_id: str | None = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> list[AnswerOut]:
     collection = db.scalar(select(Collection).where(Collection.id == collection_id))
     if not collection:
         raise HTTPException(status_code=404, detail="Collection not found")
-    answers = db.scalars(
-        select(Answer)
-        .where(Answer.collection_id == collection_id)
-        .order_by(Answer.created_at.desc())
-        .limit(min(max(limit, 1), 100))
-    ).all()
+    stmt = select(Answer).where(Answer.collection_id == collection_id)
+    if session_id:
+        stmt = stmt.where(or_(Answer.session_id == session_id, Answer.session_id.is_(None)))
+    if current_user.role not in {UserRole.admin, UserRole.maintainer}:
+        stmt = stmt.where(Answer.user_id == current_user.id)
+    answers = db.scalars(stmt.order_by(Answer.created_at.desc()).limit(min(max(limit, 1), 1000))).all()
     return [_answer_out(answer) for answer in reversed(answers)]
 
 
@@ -835,6 +836,7 @@ def chat(
     current_user: User = Depends(get_current_user),
 ) -> ChatResponse:
     payload.user_id = current_user.id
+    payload.session_id = _chat_session_id(payload.session_id)
     payload.user_acl_principals = [current_user.id, current_user.email, current_user.role.value, "public"]
     write_audit(db, current_user, "chat.query", "collection", payload.collection_id, {"question_preview": payload.question[:160]})
     db.commit()
@@ -855,6 +857,7 @@ async def chat_stream(
     """SSE-streaming chat endpoint.  Yields partial answer text as it arrives
     from RAGFlow, then sends the final event with complete answer + citations."""
     payload.user_id = current_user.id
+    payload.session_id = _chat_session_id(payload.session_id)
     payload.user_acl_principals = [current_user.id, current_user.email, current_user.role.value, "public"]
     write_audit(db, current_user, "chat.stream", "collection", payload.collection_id, {"question_preview": payload.question[:160]})
     db.commit()
@@ -1085,6 +1088,8 @@ def _answer_out(answer: Answer) -> AnswerOut:
         id=answer.id,
         trace_id=answer.trace_id,
         collection_id=answer.collection_id,
+        user_id=answer.user_id,
+        session_id=answer.session_id,
         question=answer.question,
         answer=answer.answer,
         citations=answer.citations or [],
@@ -1093,6 +1098,13 @@ def _answer_out(answer: Answer) -> AnswerOut:
         feedback=answer.feedback,
         created_at=answer.created_at.isoformat(),
     )
+
+
+def _chat_session_id(value: str | None) -> str:
+    text = (value or "").strip()
+    if re.fullmatch(r"[A-Za-z0-9._:-]{8,80}", text):
+        return text
+    return str(uuid.uuid4())
 
 
 def _status_value(document: Document) -> str:

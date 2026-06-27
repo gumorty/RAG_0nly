@@ -51,6 +51,7 @@ class ChatRequest(BaseModel):
     collection_id: str
     question: str = Field(min_length=1, max_length=4000)
     user_id: str | None = None
+    session_id: str | None = Field(default=None, max_length=80)
     user_acl_principals: list[str] = Field(default_factory=list)
     strategy: RetrievalStrategy | None = None
     history: list[ChatTurn] = Field(default_factory=list, max_length=12)
@@ -59,6 +60,7 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     answer_id: str
     trace_id: str
+    session_id: str | None = None
     answer: str
     citations: list[dict]
     evidence_score: float

@@ -124,8 +124,10 @@ export const api = {
       body: JSON.stringify({ ...payload, metadata: {} })
     }),
   listDocuments: (collectionId: string) => request<import("./types").DocumentItem[]>(`/collections/${collectionId}/documents`),
-  listAnswers: (collectionId: string, limit = 20) =>
-    request<import("./types").AnswerItem[]>(`/collections/${collectionId}/answers?limit=${limit}`),
+  listAnswers: (collectionId: string, limit = 500, sessionId?: string) =>
+    request<import("./types").AnswerItem[]>(
+      `/collections/${collectionId}/answers?limit=${limit}${sessionId ? `&session_id=${encodeURIComponent(sessionId)}` : ""}`
+    ),
   listImportBatches: (collectionId: string) => request<import("./types").ImportBatch[]>(`/collections/${collectionId}/import-batches`),
   collectionQuality: (collectionId: string) => request<import("./types").CollectionQuality>(`/collections/${collectionId}/quality`),
   meetingSummary: (collectionId: string, meetingDate?: string) =>
@@ -158,14 +160,14 @@ export const api = {
     request<{ status: string; document_id: string }>(`/documents/${documentId}`, {
       method: "DELETE"
     }),
-  chat: (payload: { collection_id: string; question: string; history?: import("./types").ChatTurn[] }) =>
+  chat: (payload: import("./types").ChatPayload) =>
     request<import("./types").ChatResponse>("/chat", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload)
     }),
   chatStream: function(
-    payload: { collection_id: string; question: string; history?: import("./types").ChatTurn[] },
+    payload: import("./types").ChatPayload,
     onEvent: (event: import("./types").StreamEvent) => void,
     onDone: () => void,
     onError: (error: string) => void,

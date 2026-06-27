@@ -38,6 +38,10 @@ services:
     ports:
       - "9100:9000"
       - "9101:9001"
+    networks:
+      default:
+        aliases:
+          - llmstart-minio
 
   api:
     build:

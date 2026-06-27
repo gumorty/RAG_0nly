@@ -77,6 +77,11 @@ Rules:
    "these issues", or "the previous document". Do not treat conversation history
    as factual evidence unless the retrieved evidence also supports it.
 7. Do not repeat the same conclusion, sentence, bullet, or citation group.
+8. For table evidence, only use values that are clearly in the same row or
+   explicitly connected cells as the queried entity. Never copy seasonal ranges,
+   floating standards, or amounts from neighboring rows/regions. If a table row
+   for the queried entity does not explicitly contain the requested field, say
+   that the evidence does not provide it.
 
 Recent conversation:
 {recent_history or "None"}

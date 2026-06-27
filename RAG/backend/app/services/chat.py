@@ -1,5 +1,7 @@
 import logging
 import re
+from html import unescape
+from html.parser import HTMLParser
 from typing import Any, Generator
 
 from sqlalchemy.orm import Session
@@ -52,6 +54,8 @@ class ChatService:
         answer = Answer(
             trace_id=trace.id,
             collection_id=request.collection_id,
+            user_id=request.user_id,
+            session_id=request.session_id,
             question=request.question,
             answer=answer_text,
             citations=citations,
@@ -63,6 +67,7 @@ class ChatService:
         return ChatResponse(
             answer_id=answer.id,
             trace_id=trace.id,
+            session_id=answer.session_id,
             answer=answer.answer,
             citations=citations,
             evidence_score=evidence_score,
@@ -164,6 +169,8 @@ class ChatService:
         answer = Answer(
             trace_id=trace.id,
             collection_id=request.collection_id,
+            user_id=request.user_id,
+            session_id=request.session_id,
             question=request.question,
             answer=answer_text,
             citations=citations,
@@ -176,6 +183,7 @@ class ChatService:
         return ChatResponse(
             answer_id=answer.id,
             trace_id=trace.id,
+            session_id=answer.session_id,
             answer=answer.answer,
             citations=citations,
             evidence_score=evidence_score,
@@ -249,6 +257,8 @@ class ChatService:
         answer = Answer(
             trace_id=trace.id,
             collection_id=request.collection_id,
+            user_id=request.user_id,
+            session_id=request.session_id,
             question=request.question,
             answer=answer_text,
             citations=citations,
@@ -261,6 +271,7 @@ class ChatService:
         return ChatResponse(
             answer_id=answer.id,
             trace_id=trace.id,
+            session_id=answer.session_id,
             answer=answer.answer,
             citations=citations,
             evidence_score=evidence_score,
@@ -372,6 +383,7 @@ class ChatService:
                     page_size=max(strategy.final_top_k, 6),
                 )
                 fallback_chunks = self._filter_ragflow_chunks_by_acl(request, collection, fallback_chunks)
+                fallback_chunks = _prepare_chunks_for_answer(request.question, fallback_chunks)
                 evidence_score = max((c.score for c in fallback_chunks), default=0.0)
                 min_score = strategy.min_evidence_score if hasattr(strategy, 'min_evidence_score') else 0.22
                 fallback_answer = _clean_answer_text(self.llm.answer(
@@ -393,6 +405,8 @@ class ChatService:
                 fallback_entity = Answer(
                     trace_id=fallback_trace.id,
                     collection_id=request.collection_id,
+                    user_id=request.user_id,
+                    session_id=request.session_id,
                     question=request.question,
                     answer=fallback_answer,
                     citations=fallback_citations,
@@ -440,6 +454,7 @@ class ChatService:
         )
         raw_chunk_count = len(chunks)
         chunks = self._filter_ragflow_chunks_by_acl(request, collection, chunks)
+        chunks = _prepare_chunks_for_answer(request.question, chunks)
         evidence_score = max([chunk.score for chunk in chunks], default=0.0)
         answer_text = _clean_answer_text(self.llm.answer(request.question, chunks, strategy.min_evidence_score, history=request.history))
         citations = [_citation_from_retrieved_chunk(chunk) for chunk in chunks]
@@ -462,6 +477,8 @@ class ChatService:
         answer = Answer(
             trace_id=trace.id,
             collection_id=request.collection_id,
+            user_id=request.user_id,
+            session_id=request.session_id,
             question=request.question,
             answer=answer_text,
             citations=citations,
@@ -474,6 +491,7 @@ class ChatService:
         return ChatResponse(
             answer_id=answer.id,
             trace_id=trace.id,
+            session_id=answer.session_id,
             answer=answer.answer,
             citations=citations,
             evidence_score=evidence_score,
@@ -701,7 +719,7 @@ def _map_ragflow_citations(ragflow_chunks: list[dict]) -> list[dict]:
                 "keyword_score": _optional_float(chunk.get("term_similarity")),
                 "rerank_score": _optional_float(chunk.get("rerank_score")),
                 "source_uri": chunk.get("source_uri"),
-                "metadata": {"ragflow_chunk": chunk},
+                "metadata": {"ragflow_chunk": _safe_citation_metadata(chunk)},
                 "preview": _preview(content),
                 "content": content,
                 "page": chunk.get("page") or chunk.get("page_num") or chunk.get("position"),
@@ -724,7 +742,7 @@ def _citation_from_retrieved_chunk(chunk) -> dict:
         "keyword_score": chunk.keyword_score,
         "rerank_score": chunk.rerank_score,
         "source_uri": chunk.source_uri,
-        "metadata": chunk.metadata,
+        "metadata": _safe_citation_metadata(chunk.metadata),
         "preview": _preview(content),
         "content": content,
         "page": raw.get("page") or raw.get("page_num") or raw.get("position"),
@@ -736,6 +754,17 @@ def _compute_ragflow_evidence_score(ragflow_chunks: list[dict]) -> float:
     return max(scores, default=0.0)
 
 
+def _safe_citation_metadata(metadata: dict | None) -> dict:
+    data = dict(metadata or {})
+    raw = data.get("ragflow")
+    if isinstance(raw, dict):
+        data["ragflow"] = _safe_citation_metadata(raw)
+    for key in ("content", "content_with_weight", "text", "preview"):
+        if key in data and data[key] is not None:
+            data[key] = _preview(_readable_evidence_text(str(data[key])), 1000)
+    return data
+
+
 def _chunk_content(chunk: dict) -> str:
     value = (
         chunk.get("content_with_weight")
@@ -744,7 +773,7 @@ def _chunk_content(chunk: dict) -> str:
         or chunk.get("preview")
         or ""
     )
-    return " ".join(str(value).split())
+    return _readable_evidence_text(str(value))
 
 
 def _chunk_title(chunk: dict) -> str:
@@ -770,6 +799,174 @@ def _chunk_title_path(chunk: dict, title: str) -> list[str]:
 def _preview(content: str, limit: int = 520) -> str:
     text = " ".join((content or "").split())
     return text[:limit]
+
+
+def _prepare_chunks_for_answer(question: str, chunks: list) -> list:
+    for chunk in chunks:
+        content = getattr(chunk, "content", "") or ""
+        try:
+            chunk.content = _focus_evidence_for_question(question, content)
+        except Exception:
+            chunk.content = _readable_evidence_text(content)
+    return chunks
+
+
+def _focus_evidence_for_question(question: str, content: str, limit: int = 5200) -> str:
+    text = _readable_evidence_text(content)
+    rows = [line.strip() for line in text.splitlines() if line.strip()]
+    is_row_like_table = any(" | " in row for row in rows)
+    if len(rows) <= 3 and not is_row_like_table:
+        return text if len(text) <= limit else text[:limit]
+    terms = _query_focus_terms(question)
+    selected: list[str] = []
+    for index, row in enumerate(rows):
+        if any(term in row for term in terms):
+            selected.append(_trim_row_around_terms(row, terms))
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for row in selected:
+        if row not in seen:
+            deduped.append(row)
+            seen.add(row)
+    if not deduped:
+        if len(text) <= limit:
+            return text
+        return text[:limit]
+    focused = "\n".join(deduped)
+    if len(focused) > limit:
+        focused = focused[:limit]
+    if is_row_like_table:
+        guard = _table_guardrail_for_question(question, focused)
+    else:
+        guard = ""
+    return (
+        "以下是从长表格/长片段中按当前问题筛出的相关行。"
+        "如果某个地区行没有明确给出旺季期间或上浮金额，不得从相邻地区推断。"
+        f"{guard}\n"
+        f"{focused}"
+    )
+
+
+def _table_guardrail_for_question(question: str, focused: str) -> str:
+    asked_season_or_float = any(term in question for term in ("旺季", "浮动", "上浮", "调整"))
+    if not asked_season_or_float:
+        return ""
+    has_explicit_field = any(term in focused for term in ("旺季", "浮动", "上浮", "调整"))
+    if has_explicit_field:
+        return ""
+    return " 当前筛出的相关行没有出现旺季/浮动/上浮字段，回答时必须说明证据未提供具体浮动信息。"
+
+
+def _trim_row_around_terms(row: str, terms: set[str], window: int = 420) -> str:
+    if len(row) <= window * 2:
+        return row
+    positions = [row.find(term) for term in terms if term and row.find(term) >= 0]
+    if not positions:
+        return row[: window * 2]
+    center = min(positions)
+    start = max(0, center - window)
+    end = min(len(row), center + window)
+    snippet = row[start:end].strip()
+    if start > 0:
+        snippet = "..." + snippet
+    if end < len(row):
+        snippet = snippet + "..."
+    return snippet
+
+
+def _query_focus_terms(question: str) -> set[str]:
+    text = question or ""
+    terms = {term for term in re.findall(r"[\u4e00-\u9fffA-Za-z0-9]{2,}", text) if len(term) >= 2}
+    for token in re.findall(r"[\u4e00-\u9fff]{2}", text):
+        terms.add(token)
+    alias_terms: set[str] = set()
+    aliases = {
+        "新疆": ["新疆", "乌鲁木齐", "石河子", "克拉玛依", "昌吉", "伊犁", "阿克苏", "喀什", "哈密", "吐鲁番", "巴音郭楞", "博尔塔拉", "阿勒泰"],
+        "青海": ["青海", "西宁", "玉树", "果洛", "海北", "黄南", "海东", "海南州", "海西"],
+        "海南": ["海南", "海口", "三亚", "三沙", "儋州", "琼海", "文昌"],
+        "西藏": ["西藏", "拉萨", "林芝", "山南", "日喀则", "昌都"],
+    }
+    for key, values in aliases.items():
+        if key in text:
+            alias_terms.update(values)
+            terms.update(values)
+    stopwords = {
+        "哪些",
+        "地区",
+        "是否",
+        "有没有",
+        "多少",
+        "怎么",
+        "什么",
+        "标准",
+        "费用",
+        "情况",
+        "旺季",
+        "期间",
+        "浮动",
+        "上浮",
+        "调整",
+        "住宿",
+        "差旅",
+    }
+    focused_terms = {term for term in terms if term not in stopwords}
+    if alias_terms:
+        latin_or_numeric = {term for term in focused_terms if re.search(r"[A-Za-z0-9]", term)}
+        return alias_terms | latin_or_numeric
+    return focused_terms
+
+
+def _readable_evidence_text(value: str) -> str:
+    text = unescape(value or "")
+    if "<table" in text.lower() or "<tr" in text.lower():
+        parsed = _html_table_to_text(text)
+        if parsed:
+            return parsed
+    text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"</(p|div|tr|table)>", "\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", " ", text)
+    lines = [" ".join(line.split()) for line in text.splitlines()]
+    return "\n".join(line for line in lines if line).strip()
+
+
+def _html_table_to_text(value: str) -> str:
+    parser = _EvidenceTableParser()
+    parser.feed(value)
+    if not parser.rows:
+        return ""
+    lines = [" | ".join(cell for cell in row if cell) for row in parser.rows]
+    return "\n".join(line for line in lines if line).strip()
+
+
+class _EvidenceTableParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.rows: list[list[str]] = []
+        self._row: list[str] | None = None
+        self._cell: list[str] | None = None
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag == "tr":
+            self._row = []
+        elif tag in {"td", "th", "caption"}:
+            self._cell = []
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in {"td", "th", "caption"} and self._cell is not None:
+            text = " ".join("".join(self._cell).split())
+            if self._row is None:
+                self._row = []
+            if text:
+                self._row.append(text)
+            self._cell = None
+        elif tag == "tr" and self._row is not None:
+            if self._row:
+                self.rows.append(self._row)
+            self._row = None
+
+    def handle_data(self, data: str) -> None:
+        if self._cell is not None:
+            self._cell.append(data)
 
 
 def _clean_answer_text(answer: str) -> str:

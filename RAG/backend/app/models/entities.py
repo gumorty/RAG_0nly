@@ -180,6 +180,8 @@ class Answer(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     trace_id: Mapped[str] = mapped_column(ForeignKey("retrieval_traces.id"), index=True)
     collection_id: Mapped[str] = mapped_column(String(36), index=True)
+    user_id: Mapped[str | None] = mapped_column(String(36), index=True)
+    session_id: Mapped[str | None] = mapped_column(String(80), index=True)
     question: Mapped[str] = mapped_column(Text)
     answer: Mapped[str] = mapped_column(Text)
     citations: Mapped[list[dict]] = mapped_column(JSON, default=list)

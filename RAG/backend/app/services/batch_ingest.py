@@ -41,8 +41,9 @@ def read_zip_documents(data: bytes, max_files: int = 200, max_file_bytes: int = 
             if info.is_dir():
                 continue
             path = PurePosixPath(info.filename)
-            if _is_system_path(path):
-                result.skipped.append({"filename": info.filename, "reason": "system_path"})
+            skip_reason = _system_path_reason(path)
+            if skip_reason:
+                result.skipped.append({"filename": info.filename, "reason": skip_reason})
                 continue
             suffix = path.suffix.lower()
             if suffix not in SUPPORTED_SUFFIXES:
@@ -68,8 +69,16 @@ def read_zip_documents(data: bytes, max_files: int = 200, max_file_bytes: int = 
 
 
 def _is_system_path(path: PurePosixPath) -> bool:
+    return _system_path_reason(path) is not None
+
+
+def _system_path_reason(path: PurePosixPath) -> str | None:
     system_names = {"__MACOSX", ".DS_Store", "Thumbs.db"}
-    return any(part.startswith(".") or part in system_names for part in path.parts)
+    if any(part.startswith(".") for part in path.parts):
+        return "hidden_path"
+    if any(part in system_names for part in path.parts):
+        return "system_path"
+    return None
 
 
 def _content_type_for_suffix(suffix: str) -> str:

@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import select
 
 from app.core.config import get_settings
-from app.models.entities import Answer, Collection, ModelConfig, RagStrategyPreset, RetrievalTrace
+from app.models.entities import Answer, Collection, Document, ModelConfig, RagStrategyPreset, RetrievalTrace
 from app.rag.llm import LLMClient
 from app.rag.retrieval import RetrievalService
 from app.rag.schemas import ChatRequest, ChatResponse, ChatTurn, RetrievalStrategy
@@ -93,7 +93,7 @@ class ChatService:
 
         # Priority 2: Chat Completions (RAGFlow retrieves + its LLM answers)
         chat_id = (collection.metadata_ or {}).get("ragflow_chat_id")
-        if self.settings.ragflow_enable_chat_completions:
+        if self.settings.ragflow_enable_chat_completions and self._can_use_unfiltered_ragflow_chat(request, collection):
             if not chat_id:
                 try:
                     chat_id = self._ensure_ragflow_chat(collection)
@@ -104,6 +104,8 @@ class ChatService:
                     return self._ask_with_ragflow_chat(request, collection, str(chat_id))
                 except (RagFlowError, ConnectionError, TimeoutError) as exc:
                     logger.warning("RAGFlow chat completions also failed: %s", exc)
+        elif self.settings.ragflow_enable_chat_completions:
+            logger.warning("Skipping RAGFlow chat completion fallback because ACL filtering cannot be enforced before generation")
 
         raise RuntimeError("All RAGFlow retrieval paths failed")
 
@@ -369,6 +371,7 @@ class ChatService:
                     request.question,
                     page_size=max(strategy.final_top_k, 6),
                 )
+                fallback_chunks = self._filter_ragflow_chunks_by_acl(request, collection, fallback_chunks)
                 evidence_score = max((c.score for c in fallback_chunks), default=0.0)
                 min_score = strategy.min_evidence_score if hasattr(strategy, 'min_evidence_score') else 0.22
                 fallback_answer = _clean_answer_text(self.llm.answer(
@@ -435,6 +438,8 @@ class ChatService:
             query,
             page_size=max(strategy.final_top_k, 6),
         )
+        raw_chunk_count = len(chunks)
+        chunks = self._filter_ragflow_chunks_by_acl(request, collection, chunks)
         evidence_score = max([chunk.score for chunk in chunks], default=0.0)
         answer_text = _clean_answer_text(self.llm.answer(request.question, chunks, strategy.min_evidence_score, history=request.history))
         citations = [_citation_from_retrieved_chunk(chunk) for chunk in chunks]
@@ -442,7 +447,13 @@ class ChatService:
             collection_id=request.collection_id,
             query=request.question,
             rewritten_query=query if query != request.question else None,
-            strategy={**strategy.model_dump(), "engine": "ragflow", "ragflow_dataset_id": dataset_id},
+            strategy={
+                **strategy.model_dump(),
+                "engine": "ragflow",
+                "ragflow_dataset_id": dataset_id,
+                "acl_filtered_from": raw_chunk_count,
+                "acl_filtered_to": len(chunks),
+            },
             candidates=citations,
             selected_context=citations,
         )
@@ -603,6 +614,55 @@ class ChatService:
             return chat_id
         except RagFlowError:
             return None
+
+    def _filter_ragflow_chunks_by_acl(self, request: ChatRequest, collection: Collection, chunks: list) -> list:
+        principals = set(request.user_acl_principals or [])
+        if {"admin", "maintainer"} & principals:
+            return chunks
+        readable = self._readable_documents(collection.id, principals)
+        allowed_ids = {doc.id for doc in readable}
+        allowed_ids.update(str((doc.metadata_ or {}).get("ragflow_document_id") or "") for doc in readable)
+        allowed_ids = {item for item in allowed_ids if item}
+        allowed_names = {doc.filename for doc in readable if doc.filename}
+        allowed_names.update(doc.title for doc in readable if doc.title)
+
+        filtered = []
+        for chunk in chunks:
+            raw = (getattr(chunk, "metadata", None) or {}).get("ragflow") or {}
+            candidate_ids = {
+                str(getattr(chunk, "document_id", "") or ""),
+                str(raw.get("document_id") or ""),
+                str(raw.get("doc_id") or ""),
+            }
+            candidate_names = {
+                str(getattr(chunk, "title", "") or ""),
+                str(raw.get("docnm_kwd") or ""),
+                str(raw.get("document_keyword") or ""),
+                str(raw.get("document_name") or ""),
+                str(raw.get("filename") or ""),
+            }
+            if (candidate_ids & allowed_ids) or (candidate_names & allowed_names):
+                filtered.append(chunk)
+        return filtered
+
+    def _can_use_unfiltered_ragflow_chat(self, request: ChatRequest, collection: Collection) -> bool:
+        principals = set(request.user_acl_principals or [])
+        if {"admin", "maintainer"} & principals:
+            return True
+        documents = self.db.scalars(select(Document).where(Document.collection_id == collection.id)).all()
+        if not documents:
+            return False
+        readable = self._readable_documents(collection.id, principals)
+        return len(readable) == len(documents)
+
+    def _readable_documents(self, collection_id: str, principals: set[str]) -> list[Document]:
+        documents = self.db.scalars(select(Document).where(Document.collection_id == collection_id)).all()
+        readable = []
+        for document in documents:
+            acl = set(document.acl or ["public"])
+            if "public" in acl or acl & principals:
+                readable.append(document)
+        return readable
 
     def _default_strategy(self) -> RetrievalStrategy:
         preset = self.db.scalar(select(RagStrategyPreset).where(RagStrategyPreset.is_default.is_(True)))

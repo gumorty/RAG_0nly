@@ -49,6 +49,7 @@ class LLMClient:
             return "\u5f53\u524d\u77e5\u8bc6\u5e93\u6ca1\u6709\u8db3\u591f\u53ef\u9760\u7684\u8bc1\u636e\u56de\u7b54\u8fd9\u4e2a\u95ee\u9898\u3002"
         if self.provider == "mock":
             lines = [
+                "Mock grounded answer:",
                 "\u57fa\u4e8e\u5f53\u524d\u77e5\u8bc6\u5e93\u8bc1\u636e\u7684\u56de\u7b54\uff1a",
                 f"\u95ee\u9898\uff1a{question}",
                 "\u8bc1\u636e\uff1a",

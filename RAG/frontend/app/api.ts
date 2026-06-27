@@ -1,5 +1,4 @@
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8010";
-const API_KEY = process.env.NEXT_PUBLIC_API_KEY || "change-this-admin-api-key";
 const ACCESS_TOKEN_KEY = "rag_access_token";
 const REFRESH_TOKEN_KEY = "rag_refresh_token";
 
@@ -28,7 +27,6 @@ async function request<T>(path: string, init?: RequestInit, retry = true): Promi
   const headers = new Headers(init?.headers);
   const token = getAccessToken();
   if (token) headers.set("Authorization", `Bearer ${token}`);
-  headers.set("X-API-Key", API_KEY);
   const response = await fetch(`${API_BASE}/api${path}`, {
     ...init,
     headers,
@@ -50,7 +48,7 @@ async function request<T>(path: string, init?: RequestInit, retry = true): Promi
 async function authRequest<T>(path: string, payload: Record<string, unknown>): Promise<T> {
   const response = await fetch(`${API_BASE}/api${path}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", "X-API-Key": API_KEY },
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
     cache: "no-store"
   }).catch((error) => {
@@ -173,7 +171,7 @@ export const api = {
     onError: (error: string) => void,
   ): AbortController {
     const controller = new AbortController();
-    const headers = new Headers({ "Content-Type": "application/json", "X-API-Key": API_KEY });
+    const headers = new Headers({ "Content-Type": "application/json" });
     const token = getAccessToken();
     if (token) headers.set("Authorization", `Bearer ${token}`);
 

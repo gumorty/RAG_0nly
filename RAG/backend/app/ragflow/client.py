@@ -498,10 +498,19 @@ class RagFlowClient:
         return None
 
     def _request(self, method: str, path: str, **kwargs: Any) -> dict:
-        with httpx.Client(timeout=180) as client:
-            response = client.request(method, f"{self.base_url}{path}", headers=self.headers, **kwargs)
-        response.raise_for_status()
-        payload = response.json()
+        url = f"{self.base_url}{path}"
+        try:
+            with httpx.Client(timeout=180) as client:
+                response = client.request(method, url, headers=self.headers, **kwargs)
+            response.raise_for_status()
+            payload = response.json()
+        except httpx.HTTPStatusError as exc:
+            detail = exc.response.text[:800] if exc.response is not None else str(exc)
+            raise RagFlowError(f"RAGFlow HTTP {exc.response.status_code} {method} {path}: {detail}") from exc
+        except httpx.HTTPError as exc:
+            raise RagFlowError(f"RAGFlow request failed {method} {path}: {exc}") from exc
+        except ValueError as exc:
+            raise RagFlowError(f"RAGFlow returned non-JSON response for {method} {path}") from exc
         if payload.get("code") not in (0, None):
             raise RagFlowError(str(payload.get("message") or payload))
         return payload

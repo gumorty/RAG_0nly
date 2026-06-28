@@ -1,4 +1,4 @@
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, Field
 
 
 class CollectionCreate(BaseModel):
@@ -28,14 +28,15 @@ class ChatSessionOut(BaseModel):
 
 
 class UserCreate(BaseModel):
-    email: EmailStr
-    name: str = Field(min_length=1, max_length=200)
+    username: str = Field(min_length=3, max_length=80, pattern=r"^[A-Za-z0-9_.@-]+$")
+    name: str | None = Field(default=None, max_length=200)
     role: str = Field(pattern="^(admin|maintainer|member|viewer)$")
     api_key: str = Field(min_length=16, max_length=200)
 
 
 class UserOut(BaseModel):
     id: str
+    username: str
     email: str
     name: str
     role: str
@@ -43,13 +44,14 @@ class UserOut(BaseModel):
 
 
 class RegisterIn(BaseModel):
-    email: EmailStr
-    name: str = Field(min_length=1, max_length=200)
+    username: str = Field(min_length=3, max_length=80, pattern=r"^[A-Za-z0-9_.@-]+$")
+    name: str | None = Field(default=None, max_length=200)
     password: str = Field(min_length=10, max_length=128)
 
 
 class LoginIn(BaseModel):
-    email: EmailStr
+    username: str | None = Field(default=None, min_length=1, max_length=80)
+    email: str | None = Field(default=None, min_length=1, max_length=120)
     password: str = Field(min_length=1, max_length=128)
 
 

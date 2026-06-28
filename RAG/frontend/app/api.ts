@@ -81,12 +81,12 @@ async function refreshSession() {
 export const auth = {
   getAccessToken,
   clearTokens,
-  login: async (payload: { email: string; password: string }) => {
+  login: async (payload: { username: string; password: string }) => {
     const tokens = await authRequest<import("./types").TokenPair>("/auth/login", payload);
     saveTokens(tokens);
     return tokens;
   },
-  register: async (payload: { email: string; name: string; password: string }) => {
+  register: async (payload: { username: string; name?: string; password: string }) => {
     const tokens = await authRequest<import("./types").TokenPair>("/auth/register", payload);
     saveTokens(tokens);
     return tokens;

@@ -74,7 +74,7 @@ class Settings(BaseSettings):
     mineru_max_file_size_mb: int = Field(default=200, ge=1, le=200)
 
     sciverse_enabled: bool = False
-    sciverse_base_url: str = "https://sciverse.space"
+    sciverse_base_url: str = "https://api.sciverse.space"
     sciverse_api_key: str = ""
 
 

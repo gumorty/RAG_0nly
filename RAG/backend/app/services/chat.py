@@ -12,7 +12,7 @@ from app.core.config import get_settings
 from app.models.entities import Answer, Collection, Document, ModelConfig, RagStrategyPreset, RagflowSession, RetrievalTrace
 from app.rag.llm import LLMClient
 from app.rag.retrieval import RetrievalService
-from app.rag.schemas import ChatRequest, ChatResponse, ChatTurn, RetrievalStrategy
+from app.rag.schemas import ChatRequest, ChatResponse, ChatTurn, RetrievalStrategy, RetrievedChunk
 from app.ragflow.client import RagFlowClient, RagFlowError
 
 logger = logging.getLogger(__name__)
@@ -470,14 +470,13 @@ class ChatService:
         if strategy.use_query_rewrite and self.llm.provider != "mock":
             query = self._rewrite_for_ragflow(request.question, request.history)
 
-        retrieval_profile = _ragflow_retrieval_profile(request.question, strategy)
-        chunks, raw_retrieval = client.retrieve_with_reranker(
+        query_plan = _ragflow_query_plan(request.question, query, request.history)
+        retrieval_profile = _ragflow_retrieval_profile(" ".join(query_plan), strategy)
+        chunks, raw_retrieval = self._retrieve_ragflow_multi_query(
+            client,
             str(dataset_id),
-            query,
-            page_size=retrieval_profile["page_size"],
-            rerank_id=(self.settings.ragflow_reranker_model or None),
-            similarity_threshold=retrieval_profile["similarity_threshold"],
-            vector_similarity_weight=retrieval_profile["vector_similarity_weight"],
+            query_plan,
+            retrieval_profile,
         )
         raw_chunk_count = len(chunks)
         chunks = self._filter_ragflow_chunks_by_acl(request, collection, chunks)
@@ -494,6 +493,7 @@ class ChatService:
                 "engine": "ragflow",
                 "ragflow_dataset_id": dataset_id,
                 "ragflow_retrieval_profile": retrieval_profile,
+                "ragflow_query_plan": query_plan,
                 "ragflow_reranker_model": self.settings.ragflow_reranker_model or None,
                 "acl_filtered_from": raw_chunk_count,
                 "acl_filtered_to": len(chunks),
@@ -527,6 +527,45 @@ class ChatService:
             evidence_score=evidence_score,
             model=answer.model,
         )
+
+    def _retrieve_ragflow_multi_query(
+        self,
+        client: RagFlowClient,
+        dataset_id: str,
+        queries: list[str],
+        retrieval_profile: dict[str, float | int | str],
+    ) -> tuple[list[RetrievedChunk], dict[str, Any]]:
+        merged: dict[str, RetrievedChunk] = {}
+        raw_runs: list[dict[str, Any]] = []
+        max_queries = 4
+        page_size = int(retrieval_profile["page_size"])
+        per_query_size = max(page_size, 8) if len(queries) <= 1 else max(page_size // 2, 8)
+        for query in queries[:max_queries]:
+            chunks, raw = client.retrieve_with_reranker(
+                dataset_id,
+                query,
+                page_size=per_query_size,
+                rerank_id=(self.settings.ragflow_reranker_model or None),
+                similarity_threshold=float(retrieval_profile["similarity_threshold"]),
+                vector_similarity_weight=float(retrieval_profile["vector_similarity_weight"]),
+            )
+            raw_runs.append({"query": query, "raw": raw})
+            for chunk in chunks:
+                key = _retrieved_chunk_key(chunk)
+                existing = merged.get(key)
+                if existing is None or chunk.score > existing.score:
+                    chunk.metadata = {
+                        **(chunk.metadata or {}),
+                        "query_variants": sorted(set((chunk.metadata or {}).get("query_variants", []) + [query])),
+                    }
+                    merged[key] = chunk
+                elif existing:
+                    existing.metadata = {
+                        **(existing.metadata or {}),
+                        "query_variants": sorted(set((existing.metadata or {}).get("query_variants", []) + [query])),
+                    }
+        ranked = sorted(merged.values(), key=lambda item: item.score, reverse=True)[:page_size]
+        return ranked, {"runs": raw_runs, "merged_count": len(merged), "returned_count": len(ranked)}
 
     # ------------------------------------------------------------------
     # Query rewrite (used by retrieval-only path)
@@ -730,6 +769,50 @@ class ChatService:
 # ------------------------------------------------------------------
 # Module-level helpers
 # ------------------------------------------------------------------
+
+
+def _ragflow_query_plan(question: str, rewritten_query: str, history: list[ChatTurn] | None = None) -> list[str]:
+    """Build a small multi-query plan for RAGFlow hybrid retrieval.
+
+    The plan is intentionally conservative: it expands broad enterprise
+    questions into a few intent-specific queries, while exact table/policy
+    questions keep the original wording prominent to avoid semantic drift.
+    """
+    candidates = [rewritten_query, question]
+    q = question or ""
+    if any(term in q for term in ("进展", "风险", "下一步", "决策", "阻塞", "计划")):
+        candidates.extend(
+            [
+                f"{q} 进展 完成内容 状态",
+                f"{q} 风险 阻塞 问题",
+                f"{q} 下一步 计划 决策",
+            ]
+        )
+    elif any(term in q for term in ("总结", "概括", "资料", "文档", "讲了什么")):
+        candidates.extend([f"{q} 关键结论", f"{q} 主题 要点"])
+    elif any(term in q for term in ("对比", "比较", "差异", "变化")):
+        candidates.append(f"{q} 对比 差异 变化")
+    if any(term in q for term in ("标准", "金额", "旺季", "上浮", "地区", "表", "年份")):
+        candidates.insert(0, q)
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for item in candidates:
+        text = " ".join((item or "").split())[:320]
+        if not text or text in seen:
+            continue
+        cleaned.append(text)
+        seen.add(text)
+    return cleaned[:4] or [question]
+
+
+def _retrieved_chunk_key(chunk: RetrievedChunk) -> str:
+    raw = (chunk.metadata or {}).get("ragflow") or {}
+    chunk_id = chunk.chunk_id or str(raw.get("chunk_id") or raw.get("id") or "")
+    doc_id = chunk.document_id or str(raw.get("doc_id") or raw.get("document_id") or "")
+    if chunk_id or doc_id:
+        return f"{doc_id}:{chunk_id}"
+    normalized = " ".join((chunk.content or "").split()).casefold()
+    return f"{chunk.title}:{normalized[:240]}"
 
 
 def _ragflow_retrieval_profile(question: str, strategy: RetrievalStrategy) -> dict[str, float | int | str]:

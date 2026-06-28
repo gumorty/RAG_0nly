@@ -28,12 +28,12 @@ class SciVerseClient:
     def agentic_search(self, query: str, **options: Any) -> dict:
         if not self.enabled():
             raise SciVerseError("SciVerse is not enabled or API key is missing")
-        return self._request("POST", "/api/sciverse/agentic-search", json={"query": query, **options})
+        return self._request("POST", "/agentic-search", json={"query": query, **options})
 
     def meta_search(self, query: str, **options: Any) -> dict:
         if not self.enabled():
             raise SciVerseError("SciVerse is not enabled or API key is missing")
-        return self._request("POST", "/api/sciverse/meta-search", json={"query": query, **options})
+        return self._request("POST", "/meta-search", json={"query": query, **options})
 
     def _request(self, method: str, path: str, **kwargs: Any) -> dict:
         url = f"{self.base_url}{path}"

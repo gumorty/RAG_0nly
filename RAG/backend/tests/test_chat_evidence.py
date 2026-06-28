@@ -1,6 +1,7 @@
 from app.rag.schemas import RetrievalStrategy
 from app.services.chat import (
     _focus_evidence_for_question,
+    _ragflow_query_plan,
     _ragflow_retrieval_profile,
     _readable_evidence_text,
 )
@@ -45,6 +46,23 @@ def test_ragflow_retrieval_profile_expands_semantic_window_for_broad_questions()
     assert profile["profile"] == "semantic_broad"
     assert profile["page_size"] >= 12
     assert profile["vector_similarity_weight"] > 0.3
+
+
+def test_query_plan_expands_enterprise_progress_questions():
+    plan = _ragflow_query_plan("当前有哪些进展和风险，下一步做什么？", "项目进展 风险 下一步", [])
+
+    assert plan[0] == "项目进展 风险 下一步"
+    assert any("完成内容" in item for item in plan)
+    assert any("阻塞" in item for item in plan)
+    assert len(plan) <= 4
+
+
+def test_query_plan_keeps_exact_table_question_first():
+    question = "新疆有哪些地区在旺季期间有浮动吗？浮动了多少？"
+    plan = _ragflow_query_plan(question, "新疆 旺季 浮动 标准", [])
+
+    assert plan[0] == question
+    assert "新疆 旺季 浮动 标准" in plan
 
 
 def test_query_focus_keeps_xinjiang_row_without_neighboring_seasonal_rows():

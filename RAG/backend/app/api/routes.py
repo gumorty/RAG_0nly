@@ -88,18 +88,52 @@ def health() -> dict:
     return {"status": "ok"}
 
 
+def _normalize_username(value: str | None) -> str:
+    username = (value or "").strip().casefold()
+    if not username:
+        raise HTTPException(status_code=422, detail="用户名不能为空")
+    return username
+
+
+def _is_collection_admin(user: User) -> bool:
+    return user.role in {UserRole.admin, UserRole.maintainer}
+
+
+def _collection_owner_id(collection: Collection) -> str | None:
+    return str((collection.metadata_ or {}).get("owner_id") or "") or None
+
+
+def _can_access_collection(user: User, collection: Collection) -> bool:
+    if _is_collection_admin(user):
+        return True
+    metadata = collection.metadata_ or {}
+    owner_id = _collection_owner_id(collection)
+    if owner_id:
+        return owner_id == user.id
+    acl = metadata.get("acl") or []
+    return bool(set([user.id, user.email, user.role.value, "public"]).intersection(set(acl)))
+
+
+def _require_collection_access(user: User, collection: Collection, *, write: bool = False) -> None:
+    if not _can_access_collection(user, collection):
+        raise HTTPException(status_code=403, detail="No permission to access this collection")
+    if write and not _is_collection_admin(user) and _collection_owner_id(collection) != user.id:
+        raise HTTPException(status_code=403, detail="No permission to modify this collection")
+
+
 @router.post("/auth/register", response_model=TokenPairOut)
 def register(payload: RegisterIn, db: Session = Depends(get_db)) -> TokenPairOut:
     validate_password_strength(payload.password)
-    existing = db.scalar(select(User).where(User.email == payload.email))
+    username = _normalize_username(payload.username)
+    existing = db.scalar(select(User).where(User.email == username))
     if existing:
-        raise HTTPException(status_code=409, detail="该邮箱已经注册")
+        raise HTTPException(status_code=409, detail="该用户名已经注册")
     total_users = db.query(User).count()
     if total_users > 0 and not get_settings().public_registration_enabled:
         raise HTTPException(status_code=403, detail="当前系统未开放公开注册，请联系管理员创建账号")
     user = User(
-        email=payload.email,
-        name=payload.name,
+        email=username,
+        name=(payload.name or username).strip() or username,
         role=UserRole.admin if total_users == 0 else UserRole.member,
         api_key_hash=hash_api_key(generate_api_key()),
         password_hash=hash_password(payload.password),
@@ -113,9 +147,10 @@ def register(payload: RegisterIn, db: Session = Depends(get_db)) -> TokenPairOut
 
 @router.post("/auth/login", response_model=TokenPairOut)
 def login(payload: LoginIn, db: Session = Depends(get_db)) -> TokenPairOut:
-    user = db.scalar(select(User).where(User.email == payload.email, User.is_active.is_(True)))
+    username = _normalize_username(payload.username or payload.email)
+    user = db.scalar(select(User).where(User.email == username, User.is_active.is_(True)))
     if not user or not verify_password(payload.password, user.password_hash):
-        raise HTTPException(status_code=401, detail="邮箱或密码不正确")
+        raise HTTPException(status_code=401, detail="用户名或密码不正确")
     user.last_login_at = datetime.utcnow()
     db.commit()
     return _token_pair(user)
@@ -210,7 +245,7 @@ def delete_model_config(
 @router.get("/admin/metrics", response_model=AdminMetricsOut)
 def admin_metrics(
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_roles(UserRole.admin, UserRole.maintainer)),
 ) -> AdminMetricsOut:
     collections = db.scalars(select(Collection)).all()
     documents = db.scalars(select(Document)).all()
@@ -287,6 +322,11 @@ def list_knowledge_gaps(
         )
     gaps = []
     for answer in db.scalars(stmt).all():
+        collection = db.scalar(select(Collection).where(Collection.id == answer.collection_id))
+        if not collection or not _can_access_collection(current_user, collection):
+            continue
+        if current_user.role not in {UserRole.admin, UserRole.maintainer} and answer.user_id != current_user.id:
+            continue
         reason = _gap_reason(answer)
         if reason:
             gaps.append(_gap_out(answer, reason))
@@ -369,12 +409,17 @@ def _try_create_ragflow_chat(
 def create_collection(
     payload: CollectionCreate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_roles(UserRole.admin, UserRole.maintainer)),
+    current_user: User = Depends(get_current_user),
 ) -> CollectionOut:
     existing = db.scalar(select(Collection).where(Collection.name == payload.name))
     if existing:
         raise HTTPException(status_code=409, detail="Collection name already exists")
-    metadata = dict(payload.metadata or {})
+    metadata = {
+        **dict(payload.metadata or {}),
+        "owner_id": current_user.id,
+        "owner_username": current_user.email,
+        "acl": [current_user.id],
+    }
     if get_settings().ragflow_enabled:
         try:
             settings = get_settings()
@@ -416,6 +461,7 @@ def list_collections(
     return [
         CollectionOut(id=item.id, name=item.name, description=item.description, metadata=item.metadata_ or {})
         for item in collections
+        if _can_access_collection(current_user, item)
     ]
 
 
@@ -423,11 +469,12 @@ def list_collections(
 def delete_collection(
     collection_id: str,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_roles(UserRole.admin, UserRole.maintainer)),
+    current_user: User = Depends(get_current_user),
 ) -> dict:
     collection = db.scalar(select(Collection).where(Collection.id == collection_id))
     if not collection:
         raise HTTPException(status_code=404, detail="Collection not found")
+    _require_collection_access(current_user, collection, write=True)
 
     metadata = collection.metadata_ or {}
     dataset_id = metadata.get("ragflow_dataset_id")
@@ -474,6 +521,7 @@ def list_chat_sessions(
     collection = db.scalar(select(Collection).where(Collection.id == collection_id))
     if not collection:
         raise HTTPException(status_code=404, detail="Collection not found")
+    _require_collection_access(current_user, collection)
     stmt = select(RagflowSession).where(RagflowSession.collection_id == collection_id)
     if current_user.role not in {UserRole.admin, UserRole.maintainer}:
         stmt = stmt.where(RagflowSession.user_id == current_user.id)
@@ -491,6 +539,7 @@ def create_chat_session(
     collection = db.scalar(select(Collection).where(Collection.id == collection_id))
     if not collection:
         raise HTTPException(status_code=404, detail="Collection not found")
+    _require_collection_access(current_user, collection, write=True)
     session = _create_local_chat_session(db, collection, current_user, payload.title)
     write_audit(db, current_user, "chat_session.create", "collection", collection_id, {"session_id": session.session_id})
     db.commit()
@@ -552,6 +601,7 @@ async def upload_document(
     collection = db.scalar(select(Collection).where(Collection.id == collection_id))
     if not collection:
         raise HTTPException(status_code=404, detail="Collection not found")
+    _require_collection_access(current_user, collection, write=True)
     filename = _safe_upload_filename(file.filename, "document")
     data = await _read_upload_bytes(file, get_settings().max_upload_size_mb)
     checksum = sha256_bytes(data)
@@ -601,6 +651,7 @@ async def ingest_url_document(
     collection = db.scalar(select(Collection).where(Collection.id == collection_id))
     if not collection:
         raise HTTPException(status_code=404, detail="Collection not found")
+    _require_collection_access(current_user, collection, write=True)
     from app.services.web_ingest import WebIngestionError, fetch_web_document
 
     try:
@@ -662,6 +713,7 @@ async def ingest_zip_batch(
     collection = db.scalar(select(Collection).where(Collection.id == collection_id))
     if not collection:
         raise HTTPException(status_code=404, detail="Collection not found")
+    _require_collection_access(current_user, collection, write=True)
     if not (file.filename or "").lower().endswith(".zip"):
         raise HTTPException(status_code=400, detail="Only .zip batch imports are supported")
     archive_filename = _safe_upload_filename(file.filename, "batch.zip")
@@ -744,7 +796,10 @@ def list_documents(
     current_user: User = Depends(get_current_user),
 ) -> list[DocumentOut]:
     collection = db.scalar(select(Collection).where(Collection.id == collection_id))
-    if collection and get_settings().ragflow_enabled:
+    if not collection:
+        raise HTTPException(status_code=404, detail="Collection not found")
+    _require_collection_access(current_user, collection)
+    if get_settings().ragflow_enabled:
         _sync_ragflow_document_statuses(db, collection)
     documents = db.scalars(select(Document).where(Document.collection_id == collection_id).order_by(Document.created_at.desc())).all()
     return [_document_out(document) for document in documents if can_read_acl(current_user, document.acl or [])]
@@ -761,6 +816,7 @@ def list_collection_answers(
     collection = db.scalar(select(Collection).where(Collection.id == collection_id))
     if not collection:
         raise HTTPException(status_code=404, detail="Collection not found")
+    _require_collection_access(current_user, collection)
     stmt = select(Answer).where(Answer.collection_id == collection_id)
     if session_id:
         stmt = stmt.where(Answer.session_id == session_id)
@@ -776,6 +832,10 @@ def list_import_batches(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> list[ImportBatchOut]:
+    collection = db.scalar(select(Collection).where(Collection.id == collection_id))
+    if not collection:
+        raise HTTPException(status_code=404, detail="Collection not found")
+    _require_collection_access(current_user, collection)
     batches = db.scalars(
         select(ImportBatch).where(ImportBatch.collection_id == collection_id).order_by(ImportBatch.created_at.desc())
     ).all()
@@ -788,6 +848,10 @@ def collection_quality(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> CollectionQualityOut:
+    collection = db.scalar(select(Collection).where(Collection.id == collection_id))
+    if not collection:
+        raise HTTPException(status_code=404, detail="Collection not found")
+    _require_collection_access(current_user, collection)
     documents = db.scalars(select(Document).where(Document.collection_id == collection_id)).all()
     warning_counts: Counter[str] = Counter()
     term_counts: Counter[str] = Counter()
@@ -833,6 +897,10 @@ def meeting_summary(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> MeetingSummaryOut:
+    collection = db.scalar(select(Collection).where(Collection.id == collection_id))
+    if not collection:
+        raise HTTPException(status_code=404, detail="Collection not found")
+    _require_collection_access(current_user, collection)
     stmt = select(Document).where(Document.collection_id == collection_id)
     if meeting_date:
         stmt = stmt.where(Document.meeting_date == meeting_date)
@@ -878,6 +946,10 @@ def document_analysis(
     document = db.scalar(select(Document).where(Document.id == document_id))
     if not document:
         raise HTTPException(status_code=404, detail="Document not found")
+    collection = db.scalar(select(Collection).where(Collection.id == document.collection_id))
+    if not collection:
+        raise HTTPException(status_code=404, detail="Collection not found")
+    _require_collection_access(current_user, collection)
     if not can_read_acl(current_user, document.acl or []):
         raise HTTPException(status_code=403, detail="No permission to read this document")
     return DocumentAnalysisOut(
@@ -891,12 +963,15 @@ def document_analysis(
 def delete_document(
     document_id: str,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_roles(UserRole.admin, UserRole.maintainer)),
+    current_user: User = Depends(get_current_user),
 ) -> dict:
     document = db.scalar(select(Document).where(Document.id == document_id))
     if not document:
         raise HTTPException(status_code=404, detail="Document not found")
     collection = db.scalar(select(Collection).where(Collection.id == document.collection_id))
+    if not collection:
+        raise HTTPException(status_code=404, detail="Collection not found")
+    _require_collection_access(current_user, collection, write=True)
     if collection and get_settings().ragflow_enabled:
         dataset_id = (collection.metadata_ or {}).get("ragflow_dataset_id")
         ragflow_doc_id = (document.metadata_ or {}).get("ragflow_document_id")
@@ -935,15 +1010,18 @@ def delete_document(
 def reindex_document(
     document_id: str,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_roles(UserRole.admin, UserRole.maintainer)),
+    current_user: User = Depends(get_current_user),
 ) -> DocumentOut:
     document = db.scalar(select(Document).where(Document.id == document_id))
     if not document:
         raise HTTPException(status_code=404, detail="Document not found")
+    collection = db.scalar(select(Collection).where(Collection.id == document.collection_id))
+    if not collection:
+        raise HTTPException(status_code=404, detail="Collection not found")
+    _require_collection_access(current_user, collection, write=True)
     write_audit(db, current_user, "document.reindex", "document", document.id, {"collection_id": document.collection_id})
     db.commit()
     if get_settings().ragflow_enabled:
-        collection = db.scalar(select(Collection).where(Collection.id == document.collection_id))
         dataset_id = (collection.metadata_ or {}).get("ragflow_dataset_id") if collection else None
         ragflow_doc_id = (document.metadata_ or {}).get("ragflow_document_id") if document.metadata_ else None
         if dataset_id and ragflow_doc_id:
@@ -968,6 +1046,7 @@ def chat(
     collection = db.scalar(select(Collection).where(Collection.id == payload.collection_id))
     if not collection:
         raise HTTPException(status_code=404, detail="Collection not found")
+    _require_collection_access(current_user, collection)
     session = _ensure_local_chat_session(db, collection, current_user, payload.session_id)
     payload.session_id = session.session_id
     payload.user_acl_principals = [current_user.id, current_user.email, current_user.role.value, "public"]
@@ -993,6 +1072,7 @@ async def chat_stream(
     collection = db.scalar(select(Collection).where(Collection.id == payload.collection_id))
     if not collection:
         raise HTTPException(status_code=404, detail="Collection not found")
+    _require_collection_access(current_user, collection)
     session = _ensure_local_chat_session(db, collection, current_user, payload.session_id)
     payload.session_id = session.session_id
     payload.user_acl_principals = [current_user.id, current_user.email, current_user.role.value, "public"]
@@ -1025,6 +1105,11 @@ def set_feedback(
     answer = db.scalar(select(Answer).where(Answer.id == answer_id))
     if not answer:
         raise HTTPException(status_code=404, detail="Answer not found")
+    collection = db.scalar(select(Collection).where(Collection.id == answer.collection_id))
+    if not collection or not _can_access_collection(current_user, collection):
+        raise HTTPException(status_code=403, detail="No permission to update this answer")
+    if current_user.role not in {UserRole.admin, UserRole.maintainer} and answer.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="No permission to update this answer")
     answer.feedback = payload.feedback
     write_audit(db, current_user, "answer.feedback", "answer", answer.id, {"feedback": payload.feedback})
     db.commit()
@@ -1089,17 +1174,18 @@ def create_user(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_roles(UserRole.admin)),
 ) -> UserOut:
-    existing = db.scalar(select(User).where(User.email == payload.email))
+    username = _normalize_username(payload.username)
+    existing = db.scalar(select(User).where(User.email == username))
     if existing:
-        raise HTTPException(status_code=409, detail="User email already exists")
+        raise HTTPException(status_code=409, detail="User username already exists")
     user = User(
-        email=payload.email,
-        name=payload.name,
+        email=username,
+        name=(payload.name or username).strip() or username,
         role=UserRole(payload.role),
         api_key_hash=hash_api_key(payload.api_key),
     )
     db.add(user)
-    write_audit(db, current_user, "user.create", "user", user.id, {"email": user.email, "role": user.role.value})
+    write_audit(db, current_user, "user.create", "user", user.id, {"username": user.email, "role": user.role.value})
     db.commit()
     return _user_out(user)
 
@@ -1152,6 +1238,9 @@ def get_trace(
     trace = db.scalar(select(RetrievalTrace).where(RetrievalTrace.id == trace_id))
     if not trace:
         raise HTTPException(status_code=404, detail="Trace not found")
+    collection = db.scalar(select(Collection).where(Collection.id == trace.collection_id))
+    if not collection or not _can_access_collection(current_user, collection):
+        raise HTTPException(status_code=403, detail="No permission to read this trace")
     return {
         "id": trace.id,
         "collection_id": trace.collection_id,
@@ -1342,7 +1431,14 @@ def _ragflow_status_quality_warnings(remote: dict) -> list[str]:
 
 
 def _user_out(user: User) -> UserOut:
-    return UserOut(id=user.id, email=user.email, name=user.name, role=user.role.value, is_active=user.is_active)
+    return UserOut(
+        id=user.id,
+        username=user.email,
+        email=user.email,
+        name=user.name,
+        role=user.role.value,
+        is_active=user.is_active,
+    )
 
 
 def _token_pair(user: User) -> TokenPairOut:

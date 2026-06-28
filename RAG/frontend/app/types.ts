@@ -175,6 +175,7 @@ export type ModelConfig = {
 
 export type User = {
   id: string;
+  username: string;
   email: string;
   name: string;
   role: string;

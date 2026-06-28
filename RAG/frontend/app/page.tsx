@@ -599,7 +599,7 @@ export default function HomePage() {
 
         <div className="userPanel">
           <UserRound size={16} />
-          <div><strong>{user.name}</strong><span>{user.email} · {user.role}</span></div>
+          <div><strong>{user.name}</strong><span>{user.username || user.email} · {user.role}</span></div>
           <button type="button" onClick={logout} aria-label="退出登录"><LogOut size={15} /></button>
         </div>
 
@@ -779,7 +779,7 @@ export default function HomePage() {
 
 function AuthPage({ onAuthenticated }: { onAuthenticated: (user: User) => Promise<void> }) {
   const [mode, setMode] = useState<"login" | "register">("login");
-  const [email, setEmail] = useState("");
+  const [username, setUsername] = useState("");
   const [name, setName] = useState("RAG Admin");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
@@ -791,8 +791,8 @@ function AuthPage({ onAuthenticated }: { onAuthenticated: (user: User) => Promis
     setError("");
     try {
       const result = mode === "login"
-        ? await auth.login({ email, password })
-        : await auth.register({ email, name, password });
+        ? await auth.login({ username, password })
+        : await auth.register({ username, name, password });
       await onAuthenticated(result.user);
     } catch (err) {
       setError(err instanceof Error ? err.message : "认证失败");
@@ -805,10 +805,10 @@ function AuthPage({ onAuthenticated }: { onAuthenticated: (user: User) => Promis
     <main className="authShell">
       <section className="authCard">
         <div className="authLogo"><img src="/rag.png" alt="RAG 知识中枢 Logo" /><div><strong>RAG 知识中枢</strong><span>RAGFlow 驱动的企业知识库</span></div></div>
-        <div><h1>{mode === "login" ? "登录系统" : "注册账号"}</h1><p>使用双 token 会话保护知识库、模型配置和导入数据。</p></div>
+        <div><h1>{mode === "login" ? "登录系统" : "注册账号"}</h1><p>使用用户名和密码登录，双 token 会话保护知识库和导入数据。</p></div>
         <form className="authForm" onSubmit={submit}>
           {mode === "register" && <label><span>姓名</span><input value={name} onChange={(event) => setName(event.target.value)} required /></label>}
-          <label><span>邮箱</span><input type="email" value={email} onChange={(event) => setEmail(event.target.value)} placeholder="admin@example.com" required /></label>
+          <label><span>用户名</span><input value={username} onChange={(event) => setUsername(event.target.value)} placeholder="admin" autoComplete="username" required /></label>
           <label><span>密码</span><input type="password" value={password} onChange={(event) => setPassword(event.target.value)} placeholder="请输入登录密码" required /></label>
           <p className="authHint">密码至少 10 位，包含大小写字母、数字和特殊字符。</p>
           {error && <div className="errorBanner">{error}</div>}

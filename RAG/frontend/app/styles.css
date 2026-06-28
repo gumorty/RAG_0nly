@@ -426,6 +426,53 @@ button:focus-visible {
   color: var(--text);
 }
 
+.iconButton.danger {
+  color: var(--danger);
+}
+
+.sessionBar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+  padding: 0 clamp(18px, 6vw, 92px);
+  overflow-x: auto;
+  flex: 0 0 auto;
+}
+
+.sessionTab {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 132px;
+  max-width: 220px;
+  min-height: 36px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.72);
+  color: var(--muted);
+}
+
+.sessionTab span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sessionTab small {
+  margin-left: auto;
+  white-space: nowrap;
+  color: var(--muted);
+}
+
+.sessionTab.active,
+.sessionTab:not(:disabled):hover {
+  border-color: rgba(15, 138, 122, 0.36);
+  background: #f7fffc;
+  color: var(--accent-strong);
+}
+
 .errorBanner {
   margin-top: 12px;
   border: 1px solid rgba(185, 67, 67, 0.24);

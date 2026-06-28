@@ -23,7 +23,7 @@ async def periodic_ragflow_sync() -> None:
     while True:
         await asyncio.sleep(interval)
         try:
-            sync_collection_document_statuses()
+            await asyncio.to_thread(sync_collection_document_statuses)
             logger.debug("RAGFlow sync completed")
         except Exception:
             logger.exception("RAGFlow periodic sync failed")
@@ -35,7 +35,7 @@ async def lifespan(app: FastAPI):
     init_db()
     if get_settings().ragflow_enabled:
         try:
-            sync_collection_document_statuses()
+            await asyncio.to_thread(sync_collection_document_statuses)
             logger.info("Startup RAGFlow sync completed")
         except Exception:
             logger.warning("Startup RAGFlow sync failed (service may not be ready yet)")
@@ -51,9 +51,12 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Enterprise RAG Knowledge Base", version="0.2.0", lifespan=lifespan)
 
+settings = get_settings()
+allowed_origins = [origin.strip() for origin in settings.cors_allowed_origins.split(",") if origin.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

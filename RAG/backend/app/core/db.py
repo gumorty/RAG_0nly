@@ -46,12 +46,21 @@ def _apply_lightweight_migrations() -> None:
         migrations.append("ALTER TABLE users ADD COLUMN token_version INTEGER DEFAULT 1")
     if "last_login_at" not in columns:
         migrations.append("ALTER TABLE users ADD COLUMN last_login_at TIMESTAMP")
+    if "answers" in inspector.get_table_names():
+        answer_columns = {column["name"] for column in inspector.get_columns("answers")}
+        if "user_id" not in answer_columns:
+            migrations.append("ALTER TABLE answers ADD COLUMN user_id VARCHAR(36)")
+        if "session_id" not in answer_columns:
+            migrations.append("ALTER TABLE answers ADD COLUMN session_id VARCHAR(80)")
     if not migrations:
         return
     with engine.begin() as connection:
         for statement in migrations:
             connection.execute(text(statement))
         connection.execute(text("UPDATE users SET token_version = 1 WHERE token_version IS NULL"))
+        if "answers" in inspector.get_table_names():
+            connection.execute(text("CREATE INDEX IF NOT EXISTS ix_answers_user_id ON answers (user_id)"))
+            connection.execute(text("CREATE INDEX IF NOT EXISTS ix_answers_session_id ON answers (session_id)"))
 
 
 def _bootstrap_admin() -> None:

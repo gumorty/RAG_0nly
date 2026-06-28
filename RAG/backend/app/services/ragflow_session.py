@@ -33,6 +33,7 @@ class RagflowSessionManager:
         self,
         collection_id: str,
         user_id: str | None = None,
+        session_id: str | None = None,
     ) -> tuple[str, str]:
         """Return ``(chat_id, session_id)`` for this collection.
 
@@ -55,18 +56,29 @@ class RagflowSessionManager:
                 "was created after this setting was enabled."
             )
 
-        # Look for an existing session for this collection + user combo
-        existing = self.db.scalar(
-            select(RagflowSession).where(
-                RagflowSession.collection_id == collection_id,
-                RagflowSession.user_id == user_id,
-            ).order_by(RagflowSession.updated_at.desc())
-        )
+        stmt = select(RagflowSession).where(RagflowSession.collection_id == collection_id)
+        if session_id:
+            stmt = stmt.where(RagflowSession.session_id == session_id)
+        else:
+            stmt = stmt.where(RagflowSession.user_id == user_id)
+        existing = self.db.scalar(stmt.order_by(RagflowSession.updated_at.desc()))
         if existing:
-            existing.turn_count += 1
-            existing.updated_at = datetime.utcnow()
-            self.db.commit()
-            return str(chat_id), existing.session_id
+            metadata = dict(existing.metadata_ or {})
+            remote_session_id = metadata.get("ragflow_remote_session_id")
+            if remote_session_id:
+                return str(chat_id), str(remote_session_id)
+        else:
+            existing = RagflowSession(
+                collection_id=collection_id,
+                chat_id=str(chat_id),
+                session_id=session_id or "",
+                user_id=user_id,
+                turn_count=0,
+                title="新对话",
+                metadata_={"kind": "management_chat_session"},
+            )
+            self.db.add(existing)
+            self.db.flush()
 
         # Create a new session in RAGFlow
         session_name = f"Session-{user_id[:8]}" if user_id else "Management-Session"
@@ -83,15 +95,10 @@ class RagflowSessionManager:
                 "RAGFlow created a session but returned no ID"
             )
 
-        record = RagflowSession(
-            collection_id=collection_id,
-            chat_id=str(chat_id),
-            session_id=remote_session_id,
-            user_id=user_id,
-            turn_count=1,
-            title=session_name,
-        )
-        self.db.add(record)
+        existing.chat_id = str(chat_id)
+        existing.user_id = user_id
+        existing.metadata_ = {**(existing.metadata_ or {}), "ragflow_remote_session_id": remote_session_id}
+        existing.updated_at = datetime.utcnow()
         self.db.commit()
         logger.info(
             "Created RAGFlow session %s for collection %s (user=%s)",
@@ -118,7 +125,9 @@ class RagflowSessionManager:
         )
         if record:
             try:
-                self.client.delete_chat(record.chat_id)  # chat_id here, session_id there
+                remote_session_id = (record.metadata_ or {}).get("ragflow_remote_session_id")
+                if remote_session_id:
+                    self.client.delete_sessions(record.chat_id, [str(remote_session_id)])
             except Exception:
                 logger.warning("Failed to delete RAGFlow session %s", session_id, exc_info=True)
             self.db.delete(record)

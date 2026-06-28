@@ -34,6 +34,7 @@ import { api, auth } from "./api";
 import type {
   AdminMetrics,
   ChatResponse,
+  ChatSession,
   ChatTurn,
   Citation,
   Collection,
@@ -129,6 +130,8 @@ export default function HomePage() {
   const [quality, setQuality] = useState<CollectionQuality | null>(null);
   const [summary, setSummary] = useState<MeetingSummary | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [sessions, setSessions] = useState<ChatSession[]>([]);
+  const [activeSessionId, setActiveSessionId] = useState("");
   const [name, setName] = useState("企业知识库");
   const [description, setDescription] = useState("项目资料、会议纪要、周报、制度文档和网页资料");
   const [uploadMeta, setUploadMeta] = useState({ author: "", project: "", meeting_date: "", tags: "" });
@@ -183,10 +186,9 @@ export default function HomePage() {
   useEffect(() => {
     if (!user) return;
     setMessages([]);
-    Promise.all([
-      loadWorkspace(),
-      loadConversation(selectedId)
-    ]).catch((err) => setError(err instanceof Error ? err.message : "加载知识库详情失败"));
+    setSessions([]);
+    setActiveSessionId("");
+    loadSelectedCollection(selectedId).catch((err) => setError(err instanceof Error ? err.message : "加载知识库详情失败"));
   }, [selectedId, user]);
 
   useEffect(() => {
@@ -237,12 +239,27 @@ export default function HomePage() {
     setBatches(nextBatches);
   }
 
-  async function loadConversation(collectionId = selectedId) {
+  async function loadSelectedCollection(collectionId = selectedId) {
     if (!collectionId) {
+      setMessages([]);
+      setSessions([]);
+      setActiveSessionId("");
+      return;
+    }
+    await loadWorkspace(collectionId);
+    const nextSessions = await api.listChatSessions(collectionId).catch(() => []);
+    const active = nextSessions[0] || await api.createChatSession(collectionId, "新对话");
+    setSessions(nextSessions.length ? nextSessions : [active]);
+    setActiveSessionId(active.session_id);
+    await loadConversation(collectionId, active.session_id);
+  }
+
+  async function loadConversation(collectionId = selectedId, sessionId = activeSessionId) {
+    if (!collectionId || !sessionId) {
       setMessages([]);
       return;
     }
-    const answers = await api.listAnswers(collectionId, 20).catch(() => []);
+    const answers = await api.listAnswers(collectionId, 1000, sessionId).catch(() => []);
     const restored: ChatMessage[] = [];
     for (const answer of answers) {
       restored.push({ id: `${answer.id}-question`, role: "user", content: answer.question });
@@ -287,6 +304,60 @@ export default function HomePage() {
       await loadCollections();
       setSelectedId(created.id);
     }, "创建知识库失败");
+  }
+
+  async function deleteCurrentCollection() {
+    if (!selectedId || !selectedCollection) return;
+    const ok = window.confirm(`确认删除知识库「${selectedCollection.name}」？这会删除本地文档、会话、问答记录，并同步删除 RAGFlow dataset。`);
+    if (!ok) return;
+    await runAction(async () => {
+      await api.deleteCollection(selectedId);
+      setMessages([]);
+      setSessions([]);
+      setActiveSessionId("");
+      setSelectedId("");
+      await loadCollections();
+      setNotice("知识库已删除，关联会话、问答记录和索引已清理。");
+    }, "删除知识库失败");
+  }
+
+  async function createNewSession() {
+    if (!selectedId) return;
+    await runAction(async () => {
+      const session = await api.createChatSession(selectedId, "新对话");
+      const nextSessions = [session, ...sessions.filter((item) => item.session_id !== session.session_id)];
+      setSessions(nextSessions);
+      setActiveSessionId(session.session_id);
+      setMessages([]);
+    }, "新建对话失败");
+  }
+
+  async function switchSession(sessionId: string) {
+    if (!selectedId || sessionId === activeSessionId) return;
+    setActiveSessionId(sessionId);
+    setMessages([]);
+    await loadConversation(selectedId, sessionId);
+  }
+
+  async function deleteCurrentSession() {
+    if (!selectedId || !activeSessionId) return;
+    const ok = window.confirm("确认删除当前对话？该对话中的问答历史和检索 trace 会从数据库中删除。");
+    if (!ok) return;
+    await runAction(async () => {
+      await api.deleteChatSession(selectedId, activeSessionId);
+      const remaining = sessions.filter((item) => item.session_id !== activeSessionId);
+      if (remaining.length > 0) {
+        setSessions(remaining);
+        setActiveSessionId(remaining[0].session_id);
+        await loadConversation(selectedId, remaining[0].session_id);
+      } else {
+        const session = await api.createChatSession(selectedId, "新对话");
+        setSessions([session]);
+        setActiveSessionId(session.session_id);
+        setMessages([]);
+      }
+      setNotice("当前对话已删除，记忆和检索 trace 已清理。");
+    }, "删除对话失败");
   }
 
   async function upload(event: FormEvent) {
@@ -334,6 +405,13 @@ export default function HomePage() {
     event?.preventDefault();
     const text = (preset || question).trim();
     if (!selectedId || !text) return;
+    let sessionId = activeSessionId;
+    if (!sessionId) {
+      const session = await api.createChatSession(selectedId, "新对话");
+      sessionId = session.session_id;
+      setActiveSessionId(sessionId);
+      setSessions((items) => [session, ...items.filter((item) => item.session_id !== session.session_id)]);
+    }
     const history = toChatHistory(messages);
     const userMessage: ChatMessage = { id: crypto.randomUUID(), role: "user", content: text };
     const assistantId = crypto.randomUUID();
@@ -344,7 +422,7 @@ export default function HomePage() {
 
     try {
       const controller = api.chatStream(
-        { collection_id: selectedId, question: text, history },
+        { collection_id: selectedId, question: text, session_id: sessionId, history },
         (event) => {
           if (event.answer) {
             setMessages((items) => {
@@ -402,7 +480,7 @@ export default function HomePage() {
     } catch {
       // fallback to non-streaming
       try {
-        const response = await api.chat({ collection_id: selectedId, question: text, history });
+        const response = await api.chat({ collection_id: selectedId, question: text, session_id: sessionId, history });
         setMessages((items) => [...items, toAssistantMessage(response)]);
         await refreshAfterChat();
       } catch (err) {
@@ -417,6 +495,7 @@ export default function HomePage() {
     await Promise.all([
       loadCollections(),
       loadWorkspace(),
+      selectedId && activeSessionId ? loadConversation(selectedId, activeSessionId) : Promise.resolve(),
       api.knowledgeGaps(selectedId).then((items) => {
         setGaps((all) => [...all.filter((gap) => gap.collection_id !== selectedId), ...items]);
       }).catch(() => undefined)
@@ -520,7 +599,7 @@ export default function HomePage() {
 
         <div className="userPanel">
           <UserRound size={16} />
-          <div><strong>{user.name}</strong><span>{user.email} · {user.role}</span></div>
+          <div><strong>{user.name}</strong><span>{user.username || user.email} · {user.role}</span></div>
           <button type="button" onClick={logout} aria-label="退出登录"><LogOut size={15} /></button>
         </div>
 
@@ -580,12 +659,31 @@ export default function HomePage() {
           <div className="headerActions">
             <StatusPill icon={<ShieldCheck size={14} />} label={`可检索率 ${readyRatio}%`} />
             <StatusPill icon={<Layers3 size={14} />} label={`${quality?.total_chunks ?? 0} 个分块`} />
+            <button className="iconButton" onClick={createNewSession} disabled={busy || !selectedId} type="button" aria-label="新建对话"><MessageSquareText size={18} /></button>
+            <button className="iconButton danger" onClick={deleteCurrentSession} disabled={busy || !activeSessionId} type="button" aria-label="删除当前对话"><Trash2 size={18} /></button>
+            <button className="iconButton danger" onClick={deleteCurrentCollection} disabled={busy || !selectedId} type="button" aria-label="删除当前知识库"><Database size={18} /></button>
             <button className="iconButton" onClick={refreshAll} disabled={busy} type="button" aria-label="刷新数据"><RefreshCw size={18} /></button>
           </div>
         </header>
 
         {error && <div className="errorBanner" role="alert">{error}</div>}
         {notice && <div className="noticeBanner" role="status"><ShieldCheck size={16} /><span>{notice}</span><button type="button" onClick={() => setNotice("")}>知道了</button></div>}
+
+        <div className="sessionBar" aria-label="对话列表">
+          {sessions.map((session) => (
+            <button
+              key={session.session_id}
+              className={session.session_id === activeSessionId ? "sessionTab active" : "sessionTab"}
+              type="button"
+              disabled={busy}
+              onClick={() => switchSession(session.session_id)}
+            >
+              <span>{safeDisplayText(session.title || `对话 ${session.session_id.slice(0, 6)}`, "新对话")}</span>
+              <small>{session.turn_count} 轮</small>
+            </button>
+          ))}
+          {sessions.length === 0 && <span className="emptyHint">暂无对话。</span>}
+        </div>
 
         <div className="chatStream" aria-live="polite">
           {messages.length === 0 && (
@@ -681,7 +779,7 @@ export default function HomePage() {
 
 function AuthPage({ onAuthenticated }: { onAuthenticated: (user: User) => Promise<void> }) {
   const [mode, setMode] = useState<"login" | "register">("login");
-  const [email, setEmail] = useState("");
+  const [username, setUsername] = useState("");
   const [name, setName] = useState("RAG Admin");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
@@ -693,8 +791,8 @@ function AuthPage({ onAuthenticated }: { onAuthenticated: (user: User) => Promis
     setError("");
     try {
       const result = mode === "login"
-        ? await auth.login({ email, password })
-        : await auth.register({ email, name, password });
+        ? await auth.login({ username, password })
+        : await auth.register({ username, name, password });
       await onAuthenticated(result.user);
     } catch (err) {
       setError(err instanceof Error ? err.message : "认证失败");
@@ -707,10 +805,10 @@ function AuthPage({ onAuthenticated }: { onAuthenticated: (user: User) => Promis
     <main className="authShell">
       <section className="authCard">
         <div className="authLogo"><img src="/rag.png" alt="RAG 知识中枢 Logo" /><div><strong>RAG 知识中枢</strong><span>RAGFlow 驱动的企业知识库</span></div></div>
-        <div><h1>{mode === "login" ? "登录系统" : "注册账号"}</h1><p>使用双 token 会话保护知识库、模型配置和导入数据。</p></div>
+        <div><h1>{mode === "login" ? "登录系统" : "注册账号"}</h1><p>使用用户名和密码登录，双 token 会话保护知识库和导入数据。</p></div>
         <form className="authForm" onSubmit={submit}>
           {mode === "register" && <label><span>姓名</span><input value={name} onChange={(event) => setName(event.target.value)} required /></label>}
-          <label><span>邮箱</span><input type="email" value={email} onChange={(event) => setEmail(event.target.value)} placeholder="admin@example.com" required /></label>
+          <label><span>用户名</span><input value={username} onChange={(event) => setUsername(event.target.value)} placeholder="admin" autoComplete="username" required /></label>
           <label><span>密码</span><input type="password" value={password} onChange={(event) => setPassword(event.target.value)} placeholder="请输入登录密码" required /></label>
           <p className="authHint">密码至少 10 位，包含大小写字母、数字和特殊字符。</p>
           {error && <div className="errorBanner">{error}</div>}

@@ -1,4 +1,18 @@
-from app.services.chat import _focus_evidence_for_question, _readable_evidence_text
+from app.rag.schemas import RetrievalStrategy
+from app.services.chat import (
+    _focus_evidence_for_question,
+    _ragflow_retrieval_profile,
+    _readable_evidence_text,
+)
+
+
+def _strategy(final_top_k: int = 8) -> RetrievalStrategy:
+    return RetrievalStrategy(
+        dense_top_k=30,
+        keyword_top_k=30,
+        final_top_k=final_top_k,
+        min_evidence_score=0.22,
+    )
 
 
 def test_html_table_evidence_is_rendered_as_readable_rows():
@@ -14,6 +28,23 @@ def test_html_table_evidence_is_rendered_as_readable_rows():
     assert "<table" not in text
     assert "地区 | 部级 | 司局级 | 其他人员 | 旺季期间" in text
     assert "北京市 | 1100 | 650 | 500" in text
+
+
+def test_ragflow_retrieval_profile_prefers_keyword_weight_for_policy_tables():
+    profile = _ragflow_retrieval_profile("新疆有哪些地区在旺季期间有浮动吗？浮动了多少？", _strategy())
+
+    assert profile["profile"] == "table_exact"
+    assert profile["page_size"] >= 16
+    assert profile["similarity_threshold"] == 0.0
+    assert profile["vector_similarity_weight"] < 0.3
+
+
+def test_ragflow_retrieval_profile_expands_semantic_window_for_broad_questions():
+    profile = _ragflow_retrieval_profile("请总结这些资料最近的项目进展和风险", _strategy())
+
+    assert profile["profile"] == "semantic_broad"
+    assert profile["page_size"] >= 12
+    assert profile["vector_similarity_weight"] > 0.3
 
 
 def test_query_focus_keeps_xinjiang_row_without_neighboring_seasonal_rows():

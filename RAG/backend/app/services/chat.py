@@ -470,10 +470,14 @@ class ChatService:
         if strategy.use_query_rewrite and self.llm.provider != "mock":
             query = self._rewrite_for_ragflow(request.question, request.history)
 
-        chunks, raw_retrieval = client.retrieve(
+        retrieval_profile = _ragflow_retrieval_profile(request.question, strategy)
+        chunks, raw_retrieval = client.retrieve_with_reranker(
             str(dataset_id),
             query,
-            page_size=max(strategy.final_top_k, 6),
+            page_size=retrieval_profile["page_size"],
+            rerank_id=(self.settings.ragflow_reranker_model or None),
+            similarity_threshold=retrieval_profile["similarity_threshold"],
+            vector_similarity_weight=retrieval_profile["vector_similarity_weight"],
         )
         raw_chunk_count = len(chunks)
         chunks = self._filter_ragflow_chunks_by_acl(request, collection, chunks)
@@ -489,6 +493,8 @@ class ChatService:
                 **strategy.model_dump(),
                 "engine": "ragflow",
                 "ragflow_dataset_id": dataset_id,
+                "ragflow_retrieval_profile": retrieval_profile,
+                "ragflow_reranker_model": self.settings.ragflow_reranker_model or None,
                 "acl_filtered_from": raw_chunk_count,
                 "acl_filtered_to": len(chunks),
             },
@@ -724,6 +730,69 @@ class ChatService:
 # ------------------------------------------------------------------
 # Module-level helpers
 # ------------------------------------------------------------------
+
+
+def _ragflow_retrieval_profile(question: str, strategy: RetrievalStrategy) -> dict[str, float | int | str]:
+    """Choose RAGFlow retrieval parameters by query intent.
+
+    RAGFlow already performs hybrid sparse+dense retrieval. This layer adjusts
+    the candidate window and sparse/dense balance for enterprise question types.
+    """
+    q = (question or "").lower()
+    page_size = max(strategy.final_top_k, 8)
+    similarity_threshold = 0.05
+    vector_similarity_weight = 0.3
+    profile = "balanced"
+
+    table_or_policy_signals = (
+        "表" in q
+        or "标准" in q
+        or "金额" in q
+        or "上浮" in q
+        or "旺季" in q
+        or "地区" in q
+        or "哪些" in q
+        or "多少" in q
+        or "分别" in q
+        or "列出" in q
+        or "年份" in q
+        or "year" in q
+        or "amount" in q
+    )
+    broad_or_colloquial_signals = (
+        "总结" in q
+        or "概括" in q
+        or "说一下" in q
+        or "讲什么" in q
+        or "这个" in q
+        or "这些" in q
+        or "最近" in q
+        or "进展" in q
+        or "风险" in q
+    )
+
+    if table_or_policy_signals:
+        profile = "table_exact"
+        page_size = max(strategy.final_top_k * 2, 16)
+        similarity_threshold = 0.0
+        vector_similarity_weight = 0.2
+    elif broad_or_colloquial_signals:
+        profile = "semantic_broad"
+        page_size = max(strategy.final_top_k + 4, 12)
+        similarity_threshold = 0.03
+        vector_similarity_weight = 0.45
+
+    if len(q.strip()) <= 8:
+        profile = f"{profile}+short_query"
+        page_size = max(page_size, 12)
+        similarity_threshold = min(similarity_threshold, 0.03)
+
+    return {
+        "profile": profile,
+        "page_size": page_size,
+        "similarity_threshold": similarity_threshold,
+        "vector_similarity_weight": vector_similarity_weight,
+    }
 
 
 def _map_ragflow_citations(ragflow_chunks: list[dict]) -> list[dict]:

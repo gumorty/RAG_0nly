@@ -10,7 +10,7 @@ class Settings(BaseSettings):
     app_env: str = "development"
     app_secret: str = "change-me"
     public_registration_enabled: bool = True
-    cors_allowed_origins: str = "http://localhost:4070,http://localhost:3010,http://localhost:3000"
+    cors_allowed_origins: str = "http://localhost:14070,http://localhost:4070,http://localhost:3010,http://localhost:3000"
     bootstrap_admin_email: str = "admin@example.com"
     bootstrap_admin_name: str = "RAG Admin"
     bootstrap_admin_api_key: str = "change-this-admin-api-key"

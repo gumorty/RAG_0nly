@@ -36,8 +36,8 @@ services:
     volumes:
       - minio_data:/data
     ports:
-      - "9100:9000"
-      - "9101:9001"
+      - "19100:9000"
+      - "19101:9001"
     networks:
       default:
         aliases:
@@ -87,7 +87,7 @@ services:
     environment:
       NEXT_PUBLIC_API_BASE_URL: http://localhost:8010
     ports:
-      - "4070:3000"
+      - "14070:3000"
     depends_on:
       - api
 

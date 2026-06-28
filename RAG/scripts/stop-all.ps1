@@ -11,4 +11,9 @@ try {
 }
 
 Write-Host "Stopping RAGFlow engine..."
-docker compose -f (Join-Path $RagflowDocker "docker-compose.yml") stop
+Push-Location $RagflowDocker
+try {
+  docker compose --profile elasticsearch --profile gpu stop
+} finally {
+  Pop-Location
+}

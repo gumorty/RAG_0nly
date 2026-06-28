@@ -76,7 +76,7 @@ from app.rag.schemas import ChatRequest, ChatResponse, RetrievalStrategy
 from app.ragflow.chunk_method import select_chunk_method
 from app.ragflow.client import RagFlowClient, RagFlowError
 from app.services.batch_ingest import read_zip_documents
-from app.services.document_normalize import normalize_for_ragflow
+from app.services.parser_router import prepare_for_ragflow
 from app.workers.ragflow_ingestion import start_background_monitor
 
 router = APIRouter()
@@ -794,6 +794,8 @@ def collection_quality(
     ready_count = 0
     failed_count = 0
     total_chunks = 0
+    quality_scores = []
+    parser_counts: Counter[str] = Counter()
     for document in documents:
         status = _status_value(document)
         if status == "ready":
@@ -801,8 +803,13 @@ def collection_quality(
         if status == "failed":
             failed_count += 1
         analysis = (document.metadata_ or {}).get("analysis", {})
+        parsed_quality = (document.metadata_ or {}).get("parsed_quality") or (document.metadata_ or {}).get("raw_quality") or {}
+        if parsed_quality.get("score") is not None:
+            quality_scores.append(float(parsed_quality.get("score") or 0))
+        parser_counts[str((document.metadata_ or {}).get("parser_engine") or "unknown")] += 1
         total_chunks += int(analysis.get("chunk_count", 0) or 0)
         warning_counts.update(analysis.get("quality_warnings", []))
+        warning_counts.update(parsed_quality.get("warnings", []))
         for term, count in analysis.get("top_terms", []):
             term_counts[str(term)] += int(count)
     return CollectionQualityOut(
@@ -814,6 +821,8 @@ def collection_quality(
         avg_chunks_per_ready_document=round(total_chunks / ready_count, 2) if ready_count else 0.0,
         warning_counts=dict(warning_counts),
         top_terms=term_counts.most_common(30),
+        avg_parse_quality_score=round(sum(quality_scores) / len(quality_scores), 3) if quality_scores else 0.0,
+        parser_engine_counts=dict(parser_counts),
     )
 
 
@@ -1246,6 +1255,7 @@ def _chat_session_out(session: RagflowSession) -> ChatSessionOut:
 
 def _document_out(document: Document) -> DocumentOut:
     analysis = (document.metadata_ or {}).get("analysis") or {}
+    parsed_quality = (document.metadata_ or {}).get("parsed_quality") or (document.metadata_ or {}).get("raw_quality") or {}
     return DocumentOut(
         id=document.id,
         collection_id=document.collection_id,
@@ -1261,6 +1271,9 @@ def _document_out(document: Document) -> DocumentOut:
         ragflow_progress=float(analysis.get("progress") or 0),
         chunk_count=int(analysis.get("chunk_count") or 0),
         token_count=int(analysis.get("token_count") or 0),
+        parser_engine=(document.metadata_ or {}).get("parser_engine"),
+        parse_quality_score=parsed_quality.get("score"),
+        parse_quality_warnings=parsed_quality.get("warnings") or [],
     )
 
 
@@ -1297,11 +1310,13 @@ def _document_status_message(document: Document, analysis: dict) -> str:
     if status == "ready":
         chunks = int(analysis.get("chunk_count") or 0)
         tokens = int(analysis.get("token_count") or 0)
+        quality = ((document.metadata_ or {}).get("parsed_quality") or (document.metadata_ or {}).get("raw_quality") or {}).get("score")
+        quality_suffix = f"，解析质量 {quality}" if quality is not None else ""
         if chunks:
-            return f"RAGFlow 已解析完成，生成 {chunks} 个分块，并写入向量索引。"
+            return f"RAGFlow 已解析完成，生成 {chunks} 个分块，并写入向量索引{quality_suffix}。"
         if tokens:
-            return f"RAGFlow 已解析完成，写入向量索引，约 {tokens} tokens。"
-        return "RAGFlow 已解析完成并写入向量索引。"
+            return f"RAGFlow 已解析完成，写入向量索引，约 {tokens} tokens{quality_suffix}。"
+        return f"RAGFlow 已解析完成并写入向量索引{quality_suffix}。"
     if status == "parsing":
         progress = float(analysis.get("progress") or 0)
         progress_msg = analysis.get("progress_msg") or "RAGFlow 正在解析、分块和构建索引。"
@@ -1309,6 +1324,21 @@ def _document_status_message(document: Document, analysis: dict) -> str:
     if status == "failed":
         return document.error_message or "RAGFlow 解析失败，请查看日志。"
     return "文档已进入 RAGFlow 处理队列。"
+
+
+def _ragflow_status_quality_warnings(remote: dict) -> list[str]:
+    warnings: list[str] = []
+    chunk_count = int(remote.get("chunk_count") or 0)
+    token_count = int(remote.get("token_count") or 0)
+    progress = float(remote.get("progress") or 0)
+    if progress >= 1.0 and chunk_count == 0:
+        warnings.append("ragflow_zero_chunks")
+    if progress >= 1.0 and token_count == 0:
+        warnings.append("ragflow_zero_tokens")
+    progress_msg = str(remote.get("progress_msg") or "").lower()
+    if "error" in progress_msg or "fail" in progress_msg:
+        warnings.append("ragflow_progress_warning")
+    return warnings
 
 
 def _user_out(user: User) -> UserOut:
@@ -1442,7 +1472,8 @@ def _ingest_with_ragflow_or_local(
         document.status = DocumentStatus.parsing
         document.error_message = None
         db.commit()
-        ragflow_filename, ragflow_data, ragflow_content_type, normalization = normalize_for_ragflow(
+        ragflow_filename, ragflow_data, ragflow_content_type, parser_metadata = prepare_for_ragflow(
+            document.id,
             document.filename,
             data,
             content_type,
@@ -1461,7 +1492,7 @@ def _ingest_with_ragflow_or_local(
             "ragflow_document_id": ragflow_doc_id,
             "ragflow_uploaded_filename": ragflow_filename,
             "ragflow_content_type": ragflow_content_type,
-            **normalization,
+            **parser_metadata,
             "ragflow_document": uploaded,
         }
         db.commit()
@@ -1516,17 +1547,18 @@ def _apply_ragflow_document_status(document: Document, remote: dict) -> None:
         document.error_message = str(remote.get("progress_msg") or "RAGFlow parsing failed")
     else:
         document.status = DocumentStatus.parsing
-    document.metadata_ = {
-        **(document.metadata_ or {}),
-        "ragflow_status": remote,
-        "analysis": {
-            **((document.metadata_ or {}).get("analysis") or {}),
-            "chunk_count": int(remote.get("chunk_count") or 0),
-            "token_count": int(remote.get("token_count") or 0),
-            "progress": float(remote.get("progress") or 0),
-            "progress_msg": remote.get("progress_msg") or "",
-        },
-    }
+        document.metadata_ = {
+            **(document.metadata_ or {}),
+            "ragflow_status": remote,
+            "analysis": {
+                **((document.metadata_ or {}).get("analysis") or {}),
+                "chunk_count": int(remote.get("chunk_count") or 0),
+                "token_count": int(remote.get("token_count") or 0),
+                "progress": float(remote.get("progress") or 0),
+                "progress_msg": remote.get("progress_msg") or "",
+                "quality_warnings": _ragflow_status_quality_warnings(remote),
+            },
+        }
 
 
 def _schedule_ingestion(document_id: str) -> None:

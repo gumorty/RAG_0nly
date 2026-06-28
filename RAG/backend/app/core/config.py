@@ -64,6 +64,19 @@ class Settings(BaseSettings):
     ragflow_agent_template: str = "qa_agent"
     ragflow_kg_enabled_default: bool = False
 
+    mineru_enabled: bool = False
+    mineru_base_url: str = "https://mineru.net"
+    mineru_api_key: str = ""
+    mineru_model_version: str = "vlm"
+    mineru_language: str = "ch"
+    mineru_timeout_seconds: int = Field(default=600, ge=30, le=3600)
+    mineru_poll_interval_seconds: int = Field(default=5, ge=1, le=60)
+    mineru_max_file_size_mb: int = Field(default=200, ge=1, le=200)
+
+    sciverse_enabled: bool = False
+    sciverse_base_url: str = "https://sciverse.space"
+    sciverse_api_key: str = ""
+
 
 @lru_cache
 def get_settings() -> Settings:

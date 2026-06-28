@@ -80,6 +80,9 @@ class DocumentOut(BaseModel):
     ragflow_progress: float | None = None
     chunk_count: int | None = None
     token_count: int | None = None
+    parser_engine: str | None = None
+    parse_quality_score: float | None = None
+    parse_quality_warnings: list[str] = Field(default_factory=list)
 
 
 class ImportBatchOut(BaseModel):
@@ -110,6 +113,8 @@ class CollectionQualityOut(BaseModel):
     avg_chunks_per_ready_document: float
     warning_counts: dict[str, int]
     top_terms: list[tuple[str, int]]
+    avg_parse_quality_score: float = 0.0
+    parser_engine_counts: dict[str, int] = Field(default_factory=dict)
 
 
 class AdminMetricsOut(BaseModel):

@@ -29,6 +29,9 @@ export type DocumentItem = {
   ragflow_progress?: number | null;
   chunk_count?: number | null;
   token_count?: number | null;
+  parser_engine?: string | null;
+  parse_quality_score?: number | null;
+  parse_quality_warnings?: string[];
 };
 
 export type ImportBatch = {
@@ -135,6 +138,8 @@ export type CollectionQuality = {
   avg_chunks_per_ready_document: number;
   warning_counts: Record<string, number>;
   top_terms: [string, number][];
+  avg_parse_quality_score: number;
+  parser_engine_counts: Record<string, number>;
 };
 
 export type MeetingSummary = {

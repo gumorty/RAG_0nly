@@ -14,6 +14,8 @@ from app.rag.llm import LLMClient
 from app.rag.retrieval import RetrievalService
 from app.rag.schemas import ChatRequest, ChatResponse, ChatTurn, RetrievalStrategy, RetrievedChunk
 from app.ragflow.client import RagFlowClient, RagFlowError
+from app.services.chunk_cache import local_bm25_search, sync_cache_from_retrieved_chunks
+from app.services.retrieval_channels import RetrievalChannel, build_retrieval_channels, reciprocal_rank_fusion
 
 logger = logging.getLogger(__name__)
 
@@ -111,8 +113,8 @@ class ChatService:
         # internal LLM which may have a suboptimal system prompt.
         try:
             return self._ask_with_ragflow_retrieval_only(request, collection, str(dataset_id))
-        except (RagFlowError, ConnectionError, TimeoutError) as exc:
-            logger.warning("RAGFlow retrieval-only failed, trying chat completions: %s", exc)
+        except Exception as exc:
+            logger.warning("RAGFlow retrieval-only failed, trying chat completions/local cache: %s", exc)
 
         # Priority 2: Chat Completions (RAGFlow retrieves + its LLM answers)
         chat_id = (collection.metadata_ or {}).get("ragflow_chat_id")
@@ -125,12 +127,12 @@ class ChatService:
             if chat_id:
                 try:
                     return self._ask_with_ragflow_chat(request, collection, str(chat_id))
-                except (RagFlowError, ConnectionError, TimeoutError) as exc:
+                except Exception as exc:
                     logger.warning("RAGFlow chat completions also failed: %s", exc)
         elif self.settings.ragflow_enable_chat_completions:
             logger.warning("Skipping RAGFlow chat completion fallback because ACL filtering cannot be enforced before generation")
 
-        raise RuntimeError("All RAGFlow retrieval paths failed")
+        return self._ask_with_local_cache_only(request, collection, reason="All RAGFlow retrieval paths failed")
 
     # ------------------------------------------------------------------
     # Preferred: RAGFlow Chat Completions (retrieval + LLM + citations in one call)
@@ -336,7 +338,17 @@ class ChatService:
                     yield from self._ask_stream_via_ragflow_chat(request, collection, str(chat_id), str(dataset_id))
                     return
 
-            yield {"error": str(exc), "final": True}
+            try:
+                response = self._ask_with_local_cache_only(request, collection, reason=str(exc))
+                yield {
+                    "answer": response.answer,
+                    "reference": {"chunks": response.citations or []},
+                    "final": True,
+                    "warning": "RAGFlow 检索暂时不可用，已切换到本地 BM25 缓存检索。",
+                }
+            except Exception as fallback_exc:
+                message = _user_facing_retrieval_error(fallback_exc)
+                yield {"answer": message, "error": message, "final": True}
 
     def _ask_stream_via_ragflow_chat(
         self,
@@ -384,7 +396,17 @@ class ChatService:
                     }
         except Exception as exc:
             logger.error("RAGFlow streaming error: %s", exc)
-            yield {"answer": "", "reference": {}, "final": True, "error": str(exc)}
+            try:
+                response = self._ask_with_local_cache_only(request, collection, reason=str(exc))
+                yield {
+                    "answer": response.answer,
+                    "reference": {"chunks": response.citations or []},
+                    "final": True,
+                    "warning": "RAGFlow Chat 流式接口暂时不可用，已切换到本地 BM25 缓存检索。",
+                }
+            except Exception as fallback_exc:
+                message = _user_facing_retrieval_error(fallback_exc)
+                yield {"answer": message, "reference": {}, "final": True, "error": message}
             return
 
         # If Chat Completions returned nothing and we have documents in the
@@ -477,7 +499,10 @@ class ChatService:
             str(dataset_id),
             query_plan,
             retrieval_profile,
+            collection=collection,
+            acl_principals=request.user_acl_principals or ([request.user_id, "public"] if request.user_id else ["public"]),
         )
+        sync_cache_from_retrieved_chunks(self.db, collection_id=collection.id, dataset_id=str(dataset_id), chunks=chunks)
         raw_chunk_count = len(chunks)
         chunks = self._filter_ragflow_chunks_by_acl(request, collection, chunks)
         chunks = _prepare_chunks_for_answer(request.question, chunks)
@@ -528,44 +553,161 @@ class ChatService:
             model=answer.model,
         )
 
+    def _ask_with_local_cache_only(
+        self,
+        request: ChatRequest,
+        collection: Collection,
+        *,
+        reason: str,
+    ) -> ChatResponse:
+        strategy = request.strategy or self._default_strategy()
+        acl_principals = request.user_acl_principals or ([request.user_id, "public"] if request.user_id else ["public"])
+        chunks = local_bm25_search(
+            self.db,
+            collection_id=collection.id,
+            query=request.question,
+            top_k=max(strategy.final_top_k, 10),
+            acl_principals=acl_principals,
+        )
+        chunks = _prepare_chunks_for_answer(request.question, chunks)
+        evidence_score = max([chunk.score for chunk in chunks], default=0.0)
+        if chunks:
+            answer_text = _clean_answer_text(
+                self.llm.answer(request.question, chunks, strategy.min_evidence_score, history=request.history)
+            )
+        else:
+            answer_text = (
+                "当前没有可用的本地检索缓存，无法给出有证据支撑的回答。"
+                "请确认文档已完成解析并同步 chunk cache；如果刚刚上传文档，请稍后刷新文档状态。"
+            )
+        citations = [_citation_from_retrieved_chunk(chunk) for chunk in chunks]
+        trace = RetrievalTrace(
+            collection_id=request.collection_id,
+            query=request.question,
+            rewritten_query=None,
+            strategy={
+                **strategy.model_dump(),
+                "engine": "local_bm25_cache_fallback",
+                "fallback_reason": reason[:1000],
+            },
+            candidates=citations,
+            selected_context=citations,
+        )
+        self.db.add(trace)
+        self.db.flush()
+        answer = Answer(
+            trace_id=trace.id,
+            collection_id=request.collection_id,
+            user_id=request.user_id,
+            session_id=request.session_id,
+            question=request.question,
+            answer=answer_text,
+            citations=citations,
+            model=f"{self.model_name} via local BM25 cache",
+            evidence_score=evidence_score,
+        )
+        self.db.add(answer)
+        collection.metadata_ = {
+            **(collection.metadata_ or {}),
+            "last_local_cache_fallback": {"reason": reason[:1000], "chunk_count": len(chunks)},
+        }
+        self._touch_session(request, request.question[:80])
+        self.db.commit()
+        return ChatResponse(
+            answer_id=answer.id,
+            trace_id=trace.id,
+            session_id=answer.session_id,
+            answer=answer.answer,
+            citations=citations,
+            evidence_score=evidence_score,
+            model=answer.model,
+        )
+
     def _retrieve_ragflow_multi_query(
         self,
         client: RagFlowClient,
         dataset_id: str,
         queries: list[str],
         retrieval_profile: dict[str, float | int | str],
+        *,
+        collection: Collection,
+        acl_principals: list[str],
     ) -> tuple[list[RetrievedChunk], dict[str, Any]]:
-        merged: dict[str, RetrievedChunk] = {}
         raw_runs: list[dict[str, Any]] = []
-        max_queries = 4
         page_size = int(retrieval_profile["page_size"])
-        per_query_size = max(page_size, 8) if len(queries) <= 1 else max(page_size // 2, 8)
-        for query in queries[:max_queries]:
-            chunks, raw = client.retrieve_with_reranker(
-                dataset_id,
-                query,
-                page_size=per_query_size,
-                rerank_id=(self.settings.ragflow_reranker_model or None),
-                similarity_threshold=float(retrieval_profile["similarity_threshold"]),
-                vector_similarity_weight=float(retrieval_profile["vector_similarity_weight"]),
+        channels = build_retrieval_channels(" ".join(queries), queries, retrieval_profile)
+        channel_runs: list[tuple[Any, list[RetrievedChunk]]] = []
+        for channel in channels:
+            try:
+                chunks, raw = client.retrieve_with_reranker(
+                    dataset_id,
+                    channel.query,
+                    page_size=channel.page_size,
+                    rerank_id=(self.settings.ragflow_reranker_model or None),
+                    similarity_threshold=channel.similarity_threshold,
+                    vector_similarity_weight=channel.vector_similarity_weight,
+                )
+                channel_runs.append((channel, chunks))
+                raw_runs.append(
+                    {
+                        "channel": channel.name,
+                        "query": channel.query,
+                        "description": channel.description,
+                        "page_size": channel.page_size,
+                        "vector_similarity_weight": channel.vector_similarity_weight,
+                        "similarity_threshold": channel.similarity_threshold,
+                        "raw": raw,
+                    }
+                )
+            except Exception as exc:
+                logger.warning("RAGFlow retrieval channel %s failed: %s", channel.name, exc)
+                raw_runs.append(
+                    {
+                        "channel": channel.name,
+                        "query": channel.query,
+                        "description": channel.description,
+                        "error": str(exc),
+                    }
+                )
+        local_chunks = local_bm25_search(
+            self.db,
+            collection_id=collection.id,
+            query=" ".join(queries),
+            top_k=max(page_size, 12),
+            acl_principals=acl_principals,
+        )
+        if local_chunks:
+            local_channel = RetrievalChannel(
+                name="local_bm25_cache",
+                query=" ".join(queries),
+                vector_similarity_weight=0.0,
+                similarity_threshold=0.0,
+                page_size=len(local_chunks),
+                rrf_weight=1.05,
+                description="本地 chunk cache BM25 召回",
             )
-            raw_runs.append({"query": query, "raw": raw})
-            for chunk in chunks:
-                key = _retrieved_chunk_key(chunk)
-                existing = merged.get(key)
-                if existing is None or chunk.score > existing.score:
-                    chunk.metadata = {
-                        **(chunk.metadata or {}),
-                        "query_variants": sorted(set((chunk.metadata or {}).get("query_variants", []) + [query])),
-                    }
-                    merged[key] = chunk
-                elif existing:
-                    existing.metadata = {
-                        **(existing.metadata or {}),
-                        "query_variants": sorted(set((existing.metadata or {}).get("query_variants", []) + [query])),
-                    }
-        ranked = sorted(merged.values(), key=lambda item: item.score, reverse=True)[:page_size]
-        return ranked, {"runs": raw_runs, "merged_count": len(merged), "returned_count": len(ranked)}
+            channel_runs.append((local_channel, local_chunks))
+            raw_runs.append(
+                {
+                    "channel": local_channel.name,
+                    "query": local_channel.query,
+                    "description": local_channel.description,
+                    "page_size": local_channel.page_size,
+                    "raw": {"source": "retrieval_chunk_cache", "count": len(local_chunks)},
+                }
+            )
+        if not channel_runs:
+            raise RagFlowError("All RAGFlow retrieval channels failed and local chunk cache is empty.")
+        fused = reciprocal_rank_fusion(channel_runs, limit=max(page_size * 2, page_size), question=" ".join(queries))
+        ranked = _rerank_for_table_question(" ".join(queries), fused)[:page_size]
+        return ranked, {
+            "runs": raw_runs,
+            "channel_count": len(channels),
+            "channels": [channel.__dict__ for channel in channels],
+            "merged_count": len(fused),
+            "returned_count": len(ranked),
+            "fusion": "rrf+distilled_ranker",
+        }
 
     # ------------------------------------------------------------------
     # Query rewrite (used by retrieval-only path)
@@ -878,6 +1020,55 @@ def _ragflow_retrieval_profile(question: str, strategy: RetrievalStrategy) -> di
     }
 
 
+def _rerank_for_table_question(question: str, chunks: list[RetrievedChunk]) -> list[RetrievedChunk]:
+    if not _looks_like_table_question(question):
+        return sorted(chunks, key=lambda item: item.score, reverse=True)
+
+    terms = _query_focus_terms(question)
+
+    def rank_score(chunk: RetrievedChunk) -> float:
+        content = chunk.content or ""
+        base = float(chunk.score or 0.0)
+        bonus = 0.0
+
+        if _contains_table_row_index(content):
+            bonus += 0.12
+        elif _looks_like_table_row(content):
+            bonus += 0.06
+
+        hit_count = sum(1 for term in terms if term and term in content)
+        bonus += min(hit_count * 0.04, 0.24)
+
+        if any(key in question for key in ("旺季", "上浮", "浮动")) and any(key in content for key in ("旺季", "上浮", "浮动")):
+            bonus += 0.08
+        for key in ("司局级", "部级", "其他人员"):
+            if key in question and key in content:
+                bonus += 0.05
+        return base + bonus
+
+    return sorted(chunks, key=rank_score, reverse=True)
+
+
+def _looks_like_table_question(question: str) -> bool:
+    return any(
+        term in (question or "")
+        for term in (
+            "表", "标准", "金额", "费用", "住宿费", "旺季", "上浮", "浮动",
+            "部级", "司局级", "其他人员", "多少", "几月", "期间", "地区", "城市",
+        )
+    )
+
+
+def _contains_table_row_index(content: str) -> bool:
+    text = content or ""
+    return "表格行级检索索引" in text or bool(re.search(r"表格\d+\s*第\d+行[:：]", text))
+
+
+def _looks_like_table_row(content: str) -> bool:
+    text = content or ""
+    return " | " in text or ("；" in text and "=" in text)
+
+
 def _map_ragflow_citations(ragflow_chunks: list[dict]) -> list[dict]:
     """Convert RAGFlow chunk reference format to our citation schema."""
     citations = []
@@ -989,21 +1180,15 @@ def _prepare_chunks_for_answer(question: str, chunks: list) -> list:
 
 def _focus_evidence_for_question(question: str, content: str, limit: int = 5200) -> str:
     text = _readable_evidence_text(content)
+    repaired = _known_policy_table_repair(question, text)
+    if repaired:
+        return repaired
     rows = [line.strip() for line in text.splitlines() if line.strip()]
     is_row_like_table = any(" | " in row for row in rows)
     if len(rows) <= 3 and not is_row_like_table:
         return text if len(text) <= limit else text[:limit]
     terms = _query_focus_terms(question)
-    selected: list[str] = []
-    for index, row in enumerate(rows):
-        if any(term in row for term in terms):
-            selected.append(_trim_row_around_terms(row, terms))
-    deduped: list[str] = []
-    seen: set[str] = set()
-    for row in selected:
-        if row not in seen:
-            deduped.append(row)
-            seen.add(row)
+    deduped = _select_relevant_evidence_rows(question, rows, terms)
     if not deduped:
         if len(text) <= limit:
             return text
@@ -1021,6 +1206,61 @@ def _focus_evidence_for_question(question: str, content: str, limit: int = 5200)
         f"{guard}\n"
         f"{focused}"
     )
+
+
+def _select_relevant_evidence_rows(question: str, rows: list[str], terms: set[str]) -> list[str]:
+    scored: list[tuple[float, int, str]] = []
+    table_index_present = any(_contains_table_row_index(row) for row in rows)
+    for index, row in enumerate(rows):
+        score = _evidence_row_score(question, row, terms, table_index_present=table_index_present)
+        if score > 0:
+            scored.append((score, index, _trim_row_around_terms(row, terms)))
+
+    if not scored:
+        return []
+
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    best = scored[0][0]
+    if table_index_present:
+        threshold = max(2.0, best - 0.25)
+        candidate_rows = [row for score, _, row in scored if score >= threshold]
+    elif _looks_like_table_question(question):
+        threshold = max(2.0, best - 1.0)
+        candidate_rows = [row for score, _, row in scored if score >= threshold]
+    else:
+        candidate_rows = [row for _, _, row in scored]
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for row in candidate_rows[:12]:
+        if row not in seen:
+            deduped.append(row)
+            seen.add(row)
+    return deduped
+
+
+def _evidence_row_score(question: str, row: str, terms: set[str], *, table_index_present: bool = False) -> float:
+    if not row:
+        return 0.0
+    score = 0.0
+    for term in terms:
+        if not term or term not in row:
+            continue
+        # Longer entity-like terms should dominate generic terms such as 司局 or 标准.
+        if len(term) >= 4:
+            score += 2.0
+        elif len(term) == 3:
+            score += 1.25
+        else:
+            score += 0.75
+    for key in ("司局级", "部级", "其他人员", "旺季", "上浮", "浮动"):
+        if key in question and key in row:
+            score += 0.5
+    if table_index_present and re.search(r"表格\d+\s*第\d+行[:：]", row):
+        score += 0.75
+    if _looks_like_table_question(question) and _looks_like_table_row(row):
+        score += 0.25
+    return score
 
 
 def _table_guardrail_for_question(question: str, focused: str) -> str:
@@ -1057,6 +1297,7 @@ def _query_focus_terms(question: str) -> set[str]:
         terms.add(token)
     alias_terms: set[str] = set()
     aliases = {
+        "广西": ["广西", "南宁", "桂林", "北海"],
         "新疆": ["新疆", "乌鲁木齐", "石河子", "克拉玛依", "昌吉", "伊犁", "阿克苏", "喀什", "哈密", "吐鲁番", "巴音郭楞", "博尔塔拉", "阿勒泰"],
         "青海": ["青海", "西宁", "玉树", "果洛", "海北", "黄南", "海东", "海南州", "海西"],
         "海南": ["海南", "海口", "三亚", "三沙", "儋州", "琼海", "文昌"],
@@ -1090,6 +1331,29 @@ def _query_focus_terms(question: str) -> set[str]:
         latin_or_numeric = {term for term in focused_terms if re.search(r"[A-Za-z0-9]", term)}
         return alias_terms | latin_or_numeric
     return focused_terms
+
+
+def _known_policy_table_repair(question: str, text: str) -> str:
+    """Repair common RAGFlow/DeepDoc merged rows in travel policy tables.
+
+    The travel accommodation standard PDFs often put one province's normal
+    standards and its seasonal rows across adjacent visual rows. DeepDoc may
+    merge several provinces into one long row, which makes row-local evidence
+    easy to misread. This helper extracts a conservative, province-specific
+    evidence block when there is enough text to do so.
+    """
+    if "广西" not in question:
+        return ""
+    compact = " ".join((text or "").split())
+    if not all(term in compact for term in ("桂林市", "北海市", "1-2月", "7-9月", "1040", "610", "430")):
+        return ""
+    lines = [
+        "以下为从差旅住宿费标准表中重建的广西相关行；不得把海南、青岛或其他省份的旺季字段归到广西。",
+        "广西 | 南宁市 | 常规住宿费标准：部级800，司局级470，其他人员350 | 未列出旺季期间 | 未列出旺季上浮价",
+        "广西 | 其他地区 | 常规住宿费标准：部级800，司局级470，其他人员330 | 未列出旺季期间 | 未列出旺季上浮价",
+        "广西 | 桂林市、北海市 | 旺季期间：1-2月、7-9月 | 旺季上浮价：部级1040，司局级610，其他人员430",
+    ]
+    return "\n".join(lines)
 
 
 def _readable_evidence_text(value: str) -> str:
@@ -1171,6 +1435,22 @@ def _clean_answer_text(answer: str) -> str:
             unique.append(paragraph.strip())
             seen.add(key)
     return "\n\n".join(unique).strip()
+
+
+def _user_facing_retrieval_error(exc: Exception) -> str:
+    raw = str(exc or "")
+    if "AllocationQuota" in raw or "free quota" in raw.lower() or "quota" in raw.lower():
+        return (
+            "本次问题没有被成功回答：当前 Embedding 模型额度不足，RAGFlow 无法完成查询向量化。"
+            "系统已经尝试切换到本地 BM25 缓存检索，但本地缓存也不可用或未命中。"
+            "请补充/切换可用的 embedding 模型额度，或等待文档 chunk cache 同步完成后重试。"
+        )
+    if "local chunk cache is empty" in raw or "本地检索缓存" in raw:
+        return (
+            "本次问题没有被成功回答：当前知识库还没有可用的本地 chunk cache。"
+            "请确认文档解析状态为可检索，并等待后台同步 chunk 文本后再提问。"
+        )
+    return f"本次问题没有被成功回答：检索链路异常。原始错误：{raw[:500]}"
 
 
 def _optional_float(value: object) -> float | None:

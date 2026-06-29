@@ -123,10 +123,11 @@ export type ChatPayload = {
 };
 
 export type StreamEvent = {
-  answer: string;
+  answer?: string;
   reference?: { chunks?: Citation[]; doc_aggs?: Array<Record<string, unknown>> };
   final: boolean;
   error?: string;
+  warning?: string;
 };
 
 export type CollectionQuality = {
@@ -159,6 +160,40 @@ export type StrategyCompareResult = {
   collection_id: string;
   results: Array<Record<string, unknown>>;
   winner?: Record<string, unknown> | null;
+};
+
+export type EvaluationDataset = {
+  id: string;
+  collection_id: string;
+  name: string;
+  description?: string | null;
+  case_count: number;
+  metadata: Record<string, unknown>;
+  created_at?: string | null;
+};
+
+export type EvaluationResult = {
+  id: string;
+  case_id: string;
+  question: string;
+  retrieved_chunk_ids: string[];
+  expected_chunk_ids: string[];
+  metrics: Record<string, number | boolean | string | null>;
+  citations: Citation[];
+  passed: boolean;
+  error_message?: string | null;
+};
+
+export type EvaluationRun = {
+  id: string;
+  dataset_id: string;
+  collection_id: string;
+  strategy: Record<string, unknown>;
+  status: string;
+  metrics: Record<string, number | string | unknown[]>;
+  started_at?: string | null;
+  completed_at?: string | null;
+  results: EvaluationResult[];
 };
 
 export type ModelConfig = {

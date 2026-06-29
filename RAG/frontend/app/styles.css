@@ -1157,6 +1157,24 @@ button:focus-visible {
   }
 }
 
+.evalToolbar {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.evalToolbar select,
+.evalToolbar button {
+  min-width: 0;
+}
+
+.evalFailureList {
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
+}
+
 @media (max-width: 900px) {
   body {
     overflow: auto;

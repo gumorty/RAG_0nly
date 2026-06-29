@@ -1,5 +1,7 @@
 from pathlib import Path
 
+from app.services.pdf_probe import probe_pdf_text_layer
+
 
 TEXT_EXTENSIONS = {".txt", ".md", ".markdown", ".csv", ".json", ".xml", ".html", ".htm", ".py", ".js", ".ts", ".java", ".go", ".sql"}
 STRUCTURED_EXTENSIONS = {".pdf", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx", ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff"}
@@ -25,6 +27,16 @@ def score_ingest_candidate(filename: str, data: bytes, content_type: str | None,
     if ext == ".pdf":
         warnings.append("pdf_layout_needs_verification")
         risk += 0.2
+        probe = probe_pdf_text_layer(data)
+        if probe.likely_scanned:
+            warnings.append("pdf_likely_scanned_requires_ocr")
+            risk += 0.45
+        if probe.encrypted:
+            warnings.append("pdf_encrypted_or_restricted")
+            risk += 0.4
+        if probe.error and probe.error != "pdf_encrypted":
+            warnings.append("pdf_text_layer_probe_failed")
+            risk += 0.15
     if ext in {".xls", ".xlsx", ".csv"}:
         warnings.append("table_structure_needs_verification")
         risk += 0.15
@@ -42,8 +54,8 @@ def score_ingest_candidate(filename: str, data: bytes, content_type: str | None,
             warnings.append("very_short_text")
             risk += 0.25
 
-    if parser_engine.startswith("mineru"):
-        risk = max(0.0, risk - 0.2)
+    if parser_engine.startswith("mineru") and "pdf_likely_scanned_requires_ocr" not in warnings:
+        risk = max(0.0, risk - 0.15)
 
     score = max(0.0, min(1.0, 1.0 - risk))
     return {

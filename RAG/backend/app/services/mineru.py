@@ -54,7 +54,7 @@ class MinerUClient:
                 {
                     "name": filename,
                     "data_id": data_id or Path(filename).stem[:120],
-                    "is_ocr": self._needs_ocr(filename),
+                    "is_ocr": self._needs_ocr(filename, data),
                 }
             ],
             "model_version": model_version,
@@ -69,9 +69,12 @@ class MinerUClient:
         if not batch_id or not upload_urls:
             raise MinerUError("MinerU did not return batch_id and upload URL")
 
-        with httpx.Client(timeout=180) as client:
-            put_response = client.put(str(upload_urls[0]), content=data)
-            put_response.raise_for_status()
+        try:
+            with httpx.Client(timeout=180) as client:
+                put_response = client.put(str(upload_urls[0]), content=data)
+                put_response.raise_for_status()
+        except httpx.HTTPError as exc:
+            raise MinerUError(f"MinerU upload failed: {exc}") from exc
 
         result = self._wait_for_batch(str(batch_id))
         zip_url = result.get("full_zip_url")
@@ -107,24 +110,46 @@ class MinerUClient:
         raise MinerUError(f"MinerU parsing timed out; last_result={last_result}")
 
     def _download_full_markdown(self, zip_url: str) -> str:
-        with httpx.Client(timeout=180, follow_redirects=True) as client:
-            response = client.get(zip_url)
-            response.raise_for_status()
-        with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
-            names = archive.namelist()
-            preferred = [name for name in names if name.endswith("full.md")]
-            markdown_name = preferred[0] if preferred else next((name for name in names if name.endswith(".md")), None)
-            if not markdown_name:
-                raise MinerUError("MinerU result zip does not contain Markdown")
-            return archive.read(markdown_name).decode("utf-8", errors="replace")
+        try:
+            with httpx.Client(timeout=180, follow_redirects=True) as client:
+                response = client.get(zip_url)
+                response.raise_for_status()
+        except httpx.HTTPError as exc:
+            raise MinerUError(f"MinerU result zip download failed: {exc}") from exc
+
+        try:
+            with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+                names = archive.namelist()
+                preferred = [name for name in names if name.endswith("full.md")]
+                markdown_name = preferred[0] if preferred else next((name for name in names if name.endswith(".md")), None)
+                if not markdown_name:
+                    raise MinerUError("MinerU result zip does not contain Markdown")
+                return archive.read(markdown_name).decode("utf-8", errors="replace")
+        except zipfile.BadZipFile as exc:
+            raise MinerUError("MinerU result zip is invalid") from exc
+        except KeyError as exc:
+            raise MinerUError("MinerU result Markdown is missing from zip") from exc
 
     def _model_version(self, filename: str) -> str:
         if Path(filename).suffix.lower() in {".html", ".htm"}:
             return "MinerU-HTML"
         return self.settings.mineru_model_version or "vlm"
 
-    def _needs_ocr(self, filename: str) -> bool:
-        return Path(filename).suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff"}
+    def _needs_ocr(self, filename: str, data: bytes | None = None) -> bool:
+        ext = Path(filename).suffix.lower()
+        if ext in {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff"}:
+            return True
+        if ext == ".pdf":
+            mode = self.settings.mineru_pdf_ocr_mode
+            if mode == "always":
+                return True
+            if mode == "never":
+                return False
+            if data:
+                from app.services.pdf_probe import probe_pdf_text_layer
+
+                return probe_pdf_text_layer(data).likely_scanned
+        return False
 
     def _request(self, method: str, path: str, **kwargs: Any) -> dict:
         url = f"{self.base_url}{path}"

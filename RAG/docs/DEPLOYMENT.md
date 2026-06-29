@@ -5,16 +5,16 @@
 ```powershell
 cd D:\Researching\LLMStart\RAG
 Copy-Item .env.example .env
-docker compose up --build -d
+powershell -ExecutionPolicy Bypass -File scripts\start-all.ps1
 ```
 
 Open:
 
-- Frontend: http://localhost:3110
-- Python/FastAPI API: http://localhost:8010/api/health
-- MinIO Console: http://localhost:9101
+- Frontend: http://localhost:14070
+- Python/FastAPI API: http://localhost:18010/api/health
+- MinIO Console: http://localhost:19101
 
-The frontend container uses `NEXT_PUBLIC_API_BASE_URL=http://localhost:8010` and `NEXT_PUBLIC_API_KEY=change-this-admin-api-key`.
+The frontend container uses `NEXT_PUBLIC_API_BASE_URL=http://localhost:18010`.
 
 ## Required Environment
 
@@ -49,7 +49,7 @@ The active model route is stored in PostgreSQL and is read by `/api/chat` at req
 
 ```powershell
 $login = Invoke-RestMethod -Method Post `
-  -Uri http://localhost:8010/api/auth/login `
+  -Uri http://localhost:18010/api/auth/login `
   -ContentType "application/json" `
   -Body '{"email":"admin@example.com","password":"Admin@123456"}'
 
@@ -58,7 +58,7 @@ $headers = @{
   "Authorization" = "Bearer $($login.access_token)"
 }
 $collection = Invoke-RestMethod -Method Post `
-  -Uri http://localhost:8010/api/collections `
+  -Uri http://localhost:18010/api/collections `
   -Headers $headers `
   -ContentType "application/json" `
   -Body '{"name":"Lab KB","description":"weekly reports","metadata":{}}'
@@ -71,7 +71,7 @@ Next: add calibrated reranker and evaluation dashboard.
 Decision: use FastAPI and PostgreSQL for deployment.
 "@
 
-curl.exe -X POST "http://localhost:8010/api/collections/$($collection.id)/documents" `
+curl.exe -X POST "http://localhost:18010/api/collections/$($collection.id)/documents" `
   -H "Authorization: Bearer $($login.access_token)" `
   -H "X-API-Key: change-this-admin-api-key" `
   -F "file=@.\data\report.txt;type=text/plain" `
@@ -79,7 +79,7 @@ curl.exe -X POST "http://localhost:8010/api/collections/$($collection.id)/docume
   -F "project=RAG"
 
 Invoke-RestMethod -Method Post `
-  -Uri http://localhost:8010/api/chat `
+  -Uri http://localhost:18010/api/chat `
   -Headers $headers `
   -ContentType "application/json" `
   -Body (@{ collection_id=$collection.id; question="What did Alice finish?" } | ConvertTo-Json)

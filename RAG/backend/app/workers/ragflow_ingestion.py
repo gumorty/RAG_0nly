@@ -14,6 +14,7 @@ from app.core.config import get_settings
 from app.core.db import SessionLocal
 from app.models.entities import Collection, Document, DocumentStatus
 from app.ragflow.client import RagFlowClient
+from app.services.chunk_cache import sync_ready_document_chunks
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +114,15 @@ def sync_collection_document_statuses(collection_id: str | None = None) -> None:
                 remote = by_id.get(str(ragflow_doc_id))
                 if remote:
                     _apply_ragflow_status(document, remote)
+                    if document.status == DocumentStatus.ready:
+                        try:
+                            synced = sync_ready_document_chunks(db, document)
+                            document.metadata_ = {
+                                **(document.metadata_ or {}),
+                                "chunk_cache_count": synced,
+                            }
+                        except Exception:
+                            logger.warning("sync: failed to sync chunk cache for document %s", document.id, exc_info=True)
                     changed = True
             if changed:
                 db.commit()
@@ -137,6 +147,15 @@ def _update_status(
         document.error_message = error_message
         if remote:
             _apply_ragflow_status(document, remote)
+        if status == DocumentStatus.ready:
+            try:
+                synced = sync_ready_document_chunks(db, document)
+                document.metadata_ = {
+                    **(document.metadata_ or {}),
+                    "chunk_cache_count": synced,
+                }
+            except Exception:
+                logger.warning("failed to sync chunk cache for document %s", document.id, exc_info=True)
         db.commit()
 
 

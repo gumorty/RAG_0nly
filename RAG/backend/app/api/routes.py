@@ -8,7 +8,7 @@ from pathlib import PurePath
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from app.api.deps import can_read_acl, get_current_user, require_roles, write_audit
@@ -61,22 +61,30 @@ from app.models.entities import (
     Collection,
     Document,
     DocumentStatus,
+    DomainLexiconTerm,
     EvalCase,
+    EvaluationCase,
+    EvaluationDataset,
+    EvaluationResult,
+    EvaluationRun,
     ImportBatch,
     ModelConfig,
     RagflowSession,
     RagStrategyPreset,
+    RetrievalChunkCache,
     RetrievalTrace,
     User,
     UserRole,
 )
 from app.rag.evaluation import EvaluationService
+from app.rag.eval_metrics import citation_readability_rate, retrieval_metrics
 from app.rag.normalize import sha256_bytes
 from app.rag.schemas import ChatRequest, ChatResponse, RetrievalStrategy
 from app.ragflow.chunk_method import select_chunk_method
 from app.ragflow.client import RagFlowClient, RagFlowError
 from app.services.batch_ingest import read_zip_documents
 from app.services.parser_router import prepare_for_ragflow
+from app.services.chunk_cache import local_bm25_search, sync_ready_document_chunks
 from app.workers.ragflow_ingestion import start_background_monitor
 
 router = APIRouter()
@@ -501,7 +509,18 @@ def delete_collection(
     db.query(Answer).filter(Answer.collection_id == collection_id).delete(synchronize_session=False)
     if trace_ids:
         db.query(RetrievalTrace).filter(RetrievalTrace.id.in_(trace_ids)).delete(synchronize_session=False)
+    run_ids = [
+        row[0]
+        for row in db.query(EvaluationRun.id).filter(EvaluationRun.collection_id == collection_id).all()
+    ]
+    if run_ids:
+        db.query(EvaluationResult).filter(EvaluationResult.run_id.in_(run_ids)).delete(synchronize_session=False)
+    db.query(EvaluationRun).filter(EvaluationRun.collection_id == collection_id).delete(synchronize_session=False)
+    db.query(EvaluationCase).filter(EvaluationCase.collection_id == collection_id).delete(synchronize_session=False)
+    db.query(EvaluationDataset).filter(EvaluationDataset.collection_id == collection_id).delete(synchronize_session=False)
     db.query(EvalCase).filter(EvalCase.collection_id == collection_id).delete(synchronize_session=False)
+    db.query(DomainLexiconTerm).filter(DomainLexiconTerm.collection_id == collection_id).delete(synchronize_session=False)
+    db.query(RetrievalChunkCache).filter(RetrievalChunkCache.collection_id == collection_id).delete(synchronize_session=False)
     db.query(ImportBatch).filter(ImportBatch.collection_id == collection_id).delete(synchronize_session=False)
     db.query(RagflowSession).filter(RagflowSession.collection_id == collection_id).delete(synchronize_session=False)
     db.query(Chunk).filter(Chunk.collection_id == collection_id).delete(synchronize_session=False)
@@ -852,6 +871,8 @@ def collection_quality(
     if not collection:
         raise HTTPException(status_code=404, detail="Collection not found")
     _require_collection_access(current_user, collection)
+    if get_settings().ragflow_enabled:
+        _sync_ragflow_document_statuses(db, collection)
     documents = db.scalars(select(Document).where(Document.collection_id == collection_id)).all()
     warning_counts: Counter[str] = Counter()
     term_counts: Counter[str] = Counter()
@@ -993,6 +1014,7 @@ def delete_document(
     except Exception:
         pass
     db.query(Chunk).filter(Chunk.document_id == document.id).delete()
+    db.query(RetrievalChunkCache).filter(RetrievalChunkCache.document_id == document.id).delete()
     write_audit(
         db,
         current_user,
@@ -1166,6 +1188,195 @@ def compare_strategies(
     db.commit()
     result = EvaluationService(db).compare_strategies(collection_id, strategies)
     return StrategyCompareOut(**result)
+
+
+@router.get("/evaluation/datasets")
+def list_evaluation_datasets(
+    collection_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> dict:
+    collection = db.scalar(select(Collection).where(Collection.id == collection_id))
+    if not collection or not _can_access_collection(current_user, collection):
+        raise HTTPException(status_code=404, detail="Collection not found")
+    datasets = db.scalars(
+        select(EvaluationDataset)
+        .where(EvaluationDataset.collection_id == collection_id)
+        .order_by(EvaluationDataset.created_at.desc())
+    ).all()
+    return {"items": [_evaluation_dataset_out(db, dataset) for dataset in datasets]}
+
+
+@router.post("/evaluation/datasets")
+def create_evaluation_dataset(
+    payload: dict,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_roles(UserRole.admin, UserRole.maintainer)),
+) -> dict:
+    collection_id = str(payload.get("collection_id") or "")
+    collection = db.scalar(select(Collection).where(Collection.id == collection_id))
+    if not collection or not _can_access_collection(current_user, collection):
+        raise HTTPException(status_code=404, detail="Collection not found")
+    dataset = EvaluationDataset(
+        collection_id=collection_id,
+        name=str(payload.get("name") or "默认测评集")[:200],
+        description=payload.get("description"),
+        metadata_=payload.get("metadata") or {},
+        created_by=current_user.id,
+    )
+    db.add(dataset)
+    write_audit(db, current_user, "evaluation_dataset.create", "collection", collection_id, {"name": dataset.name})
+    db.commit()
+    db.refresh(dataset)
+    return _evaluation_dataset_out(db, dataset)
+
+
+@router.post("/evaluation/datasets/{dataset_id}/cases")
+def create_evaluation_case(
+    dataset_id: str,
+    payload: dict,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_roles(UserRole.admin, UserRole.maintainer)),
+) -> dict:
+    dataset = db.scalar(select(EvaluationDataset).where(EvaluationDataset.id == dataset_id))
+    if not dataset:
+        raise HTTPException(status_code=404, detail="Evaluation dataset not found")
+    collection = db.scalar(select(Collection).where(Collection.id == dataset.collection_id))
+    if not collection or not _can_access_collection(current_user, collection):
+        raise HTTPException(status_code=404, detail="Collection not found")
+    case = EvaluationCase(
+        dataset_id=dataset.id,
+        collection_id=dataset.collection_id,
+        question=str(payload.get("question") or "").strip(),
+        expected_answer=payload.get("expected_answer"),
+        expected_chunk_ids=payload.get("expected_chunk_ids") or [],
+        tags=payload.get("tags") or [],
+        metadata_=payload.get("metadata") or {},
+    )
+    if not case.question:
+        raise HTTPException(status_code=422, detail="Question is required")
+    db.add(case)
+    write_audit(db, current_user, "evaluation_case.create", "evaluation_dataset", dataset_id, {"question": case.question})
+    db.commit()
+    return _evaluation_case_out(case)
+
+
+@router.post("/evaluation/datasets/{dataset_id}/runs")
+def run_evaluation_dataset(
+    dataset_id: str,
+    payload: dict | None = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_roles(UserRole.admin, UserRole.maintainer)),
+) -> dict:
+    dataset = db.scalar(select(EvaluationDataset).where(EvaluationDataset.id == dataset_id))
+    if not dataset:
+        raise HTTPException(status_code=404, detail="Evaluation dataset not found")
+    collection = db.scalar(select(Collection).where(Collection.id == dataset.collection_id))
+    if not collection or not _can_access_collection(current_user, collection):
+        raise HTTPException(status_code=404, detail="Collection not found")
+    run = EvaluationRun(
+        dataset_id=dataset.id,
+        collection_id=dataset.collection_id,
+        strategy=(payload or {}).get("strategy") or {"retriever": "local_bm25_cache", "top_k": 10},
+        status="running",
+        created_by=current_user.id,
+    )
+    db.add(run)
+    db.flush()
+    cases = db.scalars(
+        select(EvaluationCase)
+        .where(EvaluationCase.dataset_id == dataset.id)
+        .order_by(EvaluationCase.created_at.asc())
+    ).all()
+    totals = {"recall": 0.0, "mrr": 0.0, "ndcg": 0.0, "citation_readability": 0.0}
+    failures: list[dict] = []
+    for case in cases:
+        try:
+            chunks = local_bm25_search(
+                db,
+                collection_id=dataset.collection_id,
+                query=case.question,
+                top_k=int(run.strategy.get("top_k") or 10),
+                acl_principals=[current_user.id, "public"],
+            )
+            citations = [_evaluation_citation_from_chunk(chunk) for chunk in chunks]
+            retrieved_ids = [chunk.chunk_id for chunk in chunks]
+            expected_ids = case.expected_chunk_ids or []
+            metrics = retrieval_metrics(retrieved_ids, expected_ids, k=int(run.strategy.get("top_k") or 10))
+            readability = citation_readability_rate(citations)
+            case_metrics = {
+                "recall_at_k": metrics.recall_at_k,
+                "precision_at_k": metrics.precision_at_k,
+                "mrr": metrics.mrr,
+                "ndcg_at_k": metrics.ndcg_at_k,
+                "hit": metrics.hit,
+                "faithfulness": readability if citations else 0.0,
+                "citation_readability": readability,
+            }
+            passed = bool(metrics.hit) if expected_ids else bool(citations and readability >= 0.8)
+            if not passed:
+                failures.append({"case_id": case.id, "question": case.question, "metrics": case_metrics})
+            db.add(
+                EvaluationResult(
+                    run_id=run.id,
+                    case_id=case.id,
+                    question=case.question,
+                    answer=None,
+                    retrieved_chunk_ids=retrieved_ids,
+                    expected_chunk_ids=expected_ids,
+                    metrics=case_metrics,
+                    citations=citations,
+                    passed=passed,
+                )
+            )
+            totals["recall"] += metrics.recall_at_k
+            totals["mrr"] += metrics.mrr
+            totals["ndcg"] += metrics.ndcg_at_k
+            totals["citation_readability"] += readability
+        except Exception as exc:
+            failures.append({"case_id": case.id, "question": case.question, "error": str(exc)})
+            db.add(
+                EvaluationResult(
+                    run_id=run.id,
+                    case_id=case.id,
+                    question=case.question,
+                    metrics={},
+                    error_message=str(exc),
+                    passed=False,
+                )
+            )
+    total = len(cases)
+    run.status = "completed"
+    run.completed_at = datetime.utcnow()
+    run.metrics = {
+        "case_count": total,
+        "recall_at_k": totals["recall"] / total if total else 0.0,
+        "mrr": totals["mrr"] / total if total else 0.0,
+        "ndcg_at_k": totals["ndcg"] / total if total else 0.0,
+        "faithfulness": totals["citation_readability"] / total if total else 0.0,
+        "citation_readability": totals["citation_readability"] / total if total else 0.0,
+        "failure_count": len(failures),
+        "failures": failures[:20],
+    }
+    write_audit(db, current_user, "evaluation_run.create", "evaluation_dataset", dataset_id, run.metrics)
+    db.commit()
+    db.refresh(run)
+    return _evaluation_run_out(db, run)
+
+
+@router.get("/evaluation/runs/{run_id}")
+def get_evaluation_run(
+    run_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> dict:
+    run = db.scalar(select(EvaluationRun).where(EvaluationRun.id == run_id))
+    if not run:
+        raise HTTPException(status_code=404, detail="Evaluation run not found")
+    collection = db.scalar(select(Collection).where(Collection.id == run.collection_id))
+    if not collection or not _can_access_collection(current_user, collection):
+        raise HTTPException(status_code=404, detail="Collection not found")
+    return _evaluation_run_out(db, run)
 
 
 @router.post("/users", response_model=UserOut)
@@ -1381,6 +1592,84 @@ def _answer_out(answer: Answer) -> AnswerOut:
         feedback=answer.feedback,
         created_at=answer.created_at.isoformat(),
     )
+
+
+def _evaluation_dataset_out(db: Session, dataset: EvaluationDataset) -> dict:
+    case_count = db.scalar(
+        select(func.count()).select_from(EvaluationCase).where(EvaluationCase.dataset_id == dataset.id)
+    )
+    return {
+        "id": dataset.id,
+        "collection_id": dataset.collection_id,
+        "name": dataset.name,
+        "description": dataset.description,
+        "metadata": dataset.metadata_ or {},
+        "case_count": int(case_count or 0),
+        "created_at": dataset.created_at.isoformat() if dataset.created_at else None,
+    }
+
+
+def _evaluation_case_out(case: EvaluationCase) -> dict:
+    return {
+        "id": case.id,
+        "dataset_id": case.dataset_id,
+        "collection_id": case.collection_id,
+        "question": case.question,
+        "expected_answer": case.expected_answer,
+        "expected_chunk_ids": case.expected_chunk_ids or [],
+        "tags": case.tags or [],
+        "metadata": case.metadata_ or {},
+        "created_at": case.created_at.isoformat() if case.created_at else None,
+    }
+
+
+def _evaluation_run_out(db: Session, run: EvaluationRun) -> dict:
+    results = db.scalars(
+        select(EvaluationResult)
+        .where(EvaluationResult.run_id == run.id)
+        .order_by(EvaluationResult.created_at.asc())
+    ).all()
+    return {
+        "id": run.id,
+        "dataset_id": run.dataset_id,
+        "collection_id": run.collection_id,
+        "strategy": run.strategy or {},
+        "status": run.status,
+        "metrics": run.metrics or {},
+        "started_at": run.started_at.isoformat() if run.started_at else None,
+        "completed_at": run.completed_at.isoformat() if run.completed_at else None,
+        "results": [
+            {
+                "id": item.id,
+                "case_id": item.case_id,
+                "question": item.question,
+                "retrieved_chunk_ids": item.retrieved_chunk_ids or [],
+                "expected_chunk_ids": item.expected_chunk_ids or [],
+                "metrics": item.metrics or {},
+                "citations": item.citations or [],
+                "passed": item.passed,
+                "error_message": item.error_message,
+            }
+            for item in results
+        ],
+    }
+
+
+def _evaluation_citation_from_chunk(chunk) -> dict:
+    metadata = chunk.metadata or {}
+    cache = metadata.get("local_cache") or {}
+    content = chunk.content or ""
+    return {
+        "chunk_id": chunk.chunk_id,
+        "document_id": chunk.document_id,
+        "title": chunk.title,
+        "title_path": chunk.title_path or [],
+        "score": chunk.score,
+        "preview": " ".join(content.split())[:520],
+        "content": content,
+        "page": cache.get("page") or metadata.get("page"),
+        "metadata": metadata,
+    }
 
 
 def _chat_session_id(value: str | None) -> str:
@@ -1628,6 +1917,15 @@ def _sync_ragflow_document_statuses(db: Session, collection: Collection) -> None
         remote = by_id.get(str(ragflow_doc_id))
         if remote:
             _apply_ragflow_document_status(document, remote)
+            if document.status == DocumentStatus.ready:
+                try:
+                    synced = sync_ready_document_chunks(db, document)
+                    document.metadata_ = {
+                        **(document.metadata_ or {}),
+                        "chunk_cache_count": synced,
+                    }
+                except Exception:
+                    logger.warning("Failed to sync chunk cache for document %s", document.id, exc_info=True)
             changed = True
     if changed:
         db.commit()
@@ -1643,18 +1941,23 @@ def _apply_ragflow_document_status(document: Document, remote: dict) -> None:
         document.error_message = str(remote.get("progress_msg") or "RAGFlow parsing failed")
     else:
         document.status = DocumentStatus.parsing
-        document.metadata_ = {
-            **(document.metadata_ or {}),
-            "ragflow_status": remote,
-            "analysis": {
-                **((document.metadata_ or {}).get("analysis") or {}),
-                "chunk_count": int(remote.get("chunk_count") or 0),
-                "token_count": int(remote.get("token_count") or 0),
-                "progress": float(remote.get("progress") or 0),
-                "progress_msg": remote.get("progress_msg") or "",
-                "quality_warnings": _ragflow_status_quality_warnings(remote),
-            },
-        }
+        progress = float(remote.get("progress") or 0)
+    if run == "DONE":
+        progress = 1.0
+    elif run in {"FAIL", "FAILED"}:
+        progress = float(remote.get("progress") or 0)
+    document.metadata_ = {
+        **(document.metadata_ or {}),
+        "ragflow_status": remote,
+        "analysis": {
+            **((document.metadata_ or {}).get("analysis") or {}),
+            "chunk_count": int(remote.get("chunk_count") or 0),
+            "token_count": int(remote.get("token_count") or 0),
+            "progress": progress,
+            "progress_msg": remote.get("progress_msg") or "",
+            "quality_warnings": _ragflow_status_quality_warnings(remote),
+        },
+    }
 
 
 def _schedule_ingestion(document_id: str) -> None:

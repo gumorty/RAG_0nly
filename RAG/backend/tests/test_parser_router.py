@@ -48,3 +48,70 @@ def test_parsed_quality_detects_garbled_text():
 
     assert score["score"] < 1.0
     assert "garbled_characters" in score["warnings"]
+
+
+def test_prepare_for_ragflow_appends_table_index_after_mineru(monkeypatch):
+    class FakeMinerUClient:
+        def parse_file(self, filename, data, data_id=None):
+            return SimpleNamespace(
+                markdown="""
+| 地区 | 城市 | 普通_部级 | 普通_司局级 | 旺季期间 | 旺季_司局级 |
+|---|---|---:|---:|---|---:|
+| 河北 | 秦皇岛市 | 800 | 450 | 7-8月 | 680 |
+""",
+                metadata={"mineru_batch_id": "test-batch"},
+            )
+
+    monkeypatch.setattr(
+        parser_router,
+        "get_settings",
+        lambda: _settings(
+            mineru_enabled=True,
+            mineru_api_key="secret",
+            table_row_index_enabled=True,
+            table_row_index_max_rows=5000,
+        ),
+    )
+    monkeypatch.setattr(parser_router, "MinerUClient", FakeMinerUClient)
+
+    name, data, content_type, metadata = parser_router.prepare_for_ragflow(
+        "doc-1",
+        "policy.pdf",
+        b"%PDF-1.7 fake",
+        "application/pdf",
+    )
+
+    text = data.decode("utf-8")
+    assert name == "policy.pdf.mineru.md"
+    assert content_type == "text/markdown"
+    assert "表格行级检索索引" in text
+    assert "城市=秦皇岛市" in text
+    assert metadata["table_index"]["table_row_count"] == 1
+
+
+def test_prepare_for_ragflow_appends_table_index_after_normalization(monkeypatch):
+    monkeypatch.setattr(
+        parser_router,
+        "get_settings",
+        lambda: _settings(
+            mineru_enabled=False,
+            table_row_index_enabled=True,
+            table_row_index_max_rows=5000,
+        ),
+    )
+
+    csv_data = b"province,city,season,amount\nGuangxi,Guilin,Jan-Feb,1040\n"
+
+    name, data, content_type, metadata = parser_router.prepare_for_ragflow(
+        "doc-2",
+        "policy.csv",
+        csv_data,
+        "text/csv",
+    )
+
+    text = data.decode("utf-8")
+    assert name == "policy.csv.ragflow.md"
+    assert content_type == "text/markdown"
+    assert "city=Guilin" in text
+    assert "amount=1040" in text
+    assert metadata["table_index"]["table_row_count"] == 1

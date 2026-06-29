@@ -102,3 +102,33 @@ def test_query_focus_does_not_select_table_header_by_generic_words():
     assert "36 新疆" in focused
     assert "旺季浮动标准 住宿费标准" not in focused
     assert len(focused) < 1200
+
+
+def test_table_row_index_focuses_qinhuangdao_without_policy_hardcode():
+    evidence = """
+# 表格行级检索索引
+
+表格1 第1行：省份=河北；城市=秦皇岛市；普通_部级=800；普通_司局级=450；普通_其他人员=350；旺季期间=7-8月；旺季_部级=1200；旺季_司局级=680；旺季_其他人员=500。
+表格1 第2行：省份=河北；城市=张家口市；普通_部级=800；普通_司局级=450；普通_其他人员=350；旺季期间=7-9月、11-3月；旺季_部级=1200；旺季_司局级=675；旺季_其他人员=525。
+"""
+
+    focused = _focus_evidence_for_question("秦皇岛市旺季司局级住宿费是多少？", evidence)
+
+    assert "秦皇岛市" in focused
+    assert "旺季_司局级=680" in focused
+    assert "张家口市" not in focused
+
+
+def test_table_row_index_focuses_lhasa_peak_month():
+    evidence = """
+# 表格行级检索索引
+
+表格1 第1行：地区=西藏；城市=拉萨市；普通_部级=800；普通_司局级=500；普通_其他人员=350；旺季期间=6-9月；旺季_部级=1200；旺季_司局级=750；旺季_其他人员=530。
+表格1 第2行：地区=西藏；城市=其他地区；普通_部级=500；普通_司局级=400；普通_其他人员=300；旺季期间=6-9月；旺季_部级=800；旺季_司局级=500；旺季_其他人员=350。
+"""
+
+    focused = _focus_evidence_for_question("8月去拉萨，司局级住宿费上限是多少？", evidence)
+
+    assert "拉萨市" in focused
+    assert "旺季_司局级=750" in focused
+    assert "其他地区" not in focused

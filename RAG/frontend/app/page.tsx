@@ -40,6 +40,8 @@ import type {
   Collection,
   CollectionQuality,
   DocumentItem,
+  EvaluationDataset,
+  EvaluationRun,
   ImportBatch,
   KnowledgeGap,
   MeetingSummary,
@@ -129,6 +131,10 @@ export default function HomePage() {
   const [batches, setBatches] = useState<ImportBatch[]>([]);
   const [quality, setQuality] = useState<CollectionQuality | null>(null);
   const [summary, setSummary] = useState<MeetingSummary | null>(null);
+  const [evaluationDatasets, setEvaluationDatasets] = useState<EvaluationDataset[]>([]);
+  const [activeEvaluationDatasetId, setActiveEvaluationDatasetId] = useState("");
+  const [evaluationRun, setEvaluationRun] = useState<EvaluationRun | null>(null);
+  const [evaluationBusy, setEvaluationBusy] = useState(false);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [sessions, setSessions] = useState<ChatSession[]>([]);
   const [activeSessionId, setActiveSessionId] = useState("");
@@ -225,18 +231,26 @@ export default function HomePage() {
       setBatches([]);
       setQuality(null);
       setSummary(null);
+      setEvaluationDatasets([]);
+      setActiveEvaluationDatasetId("");
+      setEvaluationRun(null);
       return;
     }
-    const [nextDocuments, nextQuality, nextSummary, nextBatches] = await Promise.all([
+    const [nextDocuments, nextQuality, nextSummary, nextBatches, nextEvaluationDatasets] = await Promise.all([
       api.listDocuments(collectionId),
       api.collectionQuality(collectionId).catch(() => null),
       api.meetingSummary(collectionId).catch(() => null),
-      api.listImportBatches(collectionId).catch(() => [])
+      api.listImportBatches(collectionId).catch(() => []),
+      api.listEvaluationDatasets(collectionId).then((res) => res.items).catch(() => [])
     ]);
     setDocuments(nextDocuments);
     setQuality(nextQuality);
     setSummary(nextSummary);
     setBatches(nextBatches);
+    setEvaluationDatasets(nextEvaluationDatasets);
+    setActiveEvaluationDatasetId((current) => current && nextEvaluationDatasets.some((item) => item.id === current)
+      ? current
+      : nextEvaluationDatasets[0]?.id || "");
   }
 
   async function loadSelectedCollection(collectionId = selectedId) {
@@ -424,17 +438,25 @@ export default function HomePage() {
       const controller = api.chatStream(
         { collection_id: selectedId, question: text, session_id: sessionId, history },
         (event) => {
+          if (event.error && !event.answer) {
+            setMessages((items) => ensureAssistantMessage(items, assistantId, event.error || "检索链路异常，本次问题没有生成回答。"));
+            setError(event.error);
+          }
           if (event.answer) {
+            const answerText = event.answer;
             setMessages((items) => {
               const updated = [...items];
               const last = updated[updated.length - 1];
               if (last && last.role === "assistant") {
-                last.content = mergeAssistantContent(last.content, event.answer);
+                last.content = mergeAssistantContent(last.content, answerText);
               } else {
-                updated.push({ id: assistantId, role: "assistant", content: event.answer });
+                updated.push({ id: assistantId, role: "assistant", content: answerText });
               }
               return updated;
             });
+          }
+          if (event.final && !event.answer && !event.reference?.chunks?.length && !event.error) {
+            setMessages((items) => ensureAssistantMessage(items, assistantId, "本次检索结束，但没有生成可展示的回答。请查看后台日志或稍后重试。"));
           }
           if (event.final && event.reference?.chunks) {
             const ragCitations = event.reference.chunks.map(normalizeCitation);
@@ -469,6 +491,8 @@ export default function HomePage() {
             const last = updated[updated.length - 1];
             if (last && last.role === "assistant") {
               last.content = errMsg;
+            } else {
+              updated.push({ id: assistantId, role: "assistant", content: errMsg });
             }
             return updated;
           });
@@ -534,6 +558,57 @@ export default function HomePage() {
       await api.answerToEvalCase(answerId);
       setGaps(await api.knowledgeGaps(selectedId));
     }, "加入评估集失败");
+  }
+
+  async function createDefaultEvaluationDataset() {
+    if (!selectedId) return;
+    await runAction(async () => {
+      const dataset = await api.createEvaluationDataset({
+        collection_id: selectedId,
+        name: `${selectedCollectionName} 测评集`,
+        description: "用于检验召回、排序、引用可读率和低证据失败样例。"
+      });
+      setEvaluationDatasets((items) => [dataset, ...items.filter((item) => item.id !== dataset.id)]);
+      setActiveEvaluationDatasetId(dataset.id);
+      setNotice("测评集已创建，可以继续从低证据问题沉淀用例。");
+    }, "创建测评集失败");
+  }
+
+  async function addGapToEvaluation(gap: KnowledgeGap) {
+    const datasetId = activeEvaluationDatasetId || evaluationDatasets[0]?.id;
+    if (!datasetId) {
+      setError("请先创建测评集。");
+      return;
+    }
+    await runAction(async () => {
+      await api.createEvaluationCase(datasetId, {
+        question: gap.question,
+        expected_chunk_ids: gap.citations?.map((citation) => citation.chunk_id).filter(Boolean) || [],
+        metadata: { source: "knowledge_gap", answer_id: gap.id, reason: gap.reason }
+      });
+      const next = await api.listEvaluationDatasets(selectedId);
+      setEvaluationDatasets(next.items);
+      setNotice("失败样例已加入测评集。");
+    }, "加入测评集失败");
+  }
+
+  async function runEvaluationCenter() {
+    const datasetId = activeEvaluationDatasetId || evaluationDatasets[0]?.id;
+    if (!datasetId) {
+      setError("请先创建或选择一个测评集。");
+      return;
+    }
+    setEvaluationBusy(true);
+    setError("");
+    try {
+      const run = await api.runEvaluation(datasetId, { strategy: { retriever: "local_bm25_cache", top_k: 10 } });
+      setEvaluationRun(run);
+      setNotice("测评运行完成。");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "测评运行失败");
+    } finally {
+      setEvaluationBusy(false);
+    }
   }
 
   async function deleteDocument(documentId: string) {
@@ -650,6 +725,53 @@ export default function HomePage() {
               ))}
             </div>
           </details>
+        </section>
+
+        <section className="inspectorPanel">
+          <PanelTitle icon={<BrainCircuit size={18} />} title="测评中心" meta="召回、排序、引用质量回归" />
+          <div className="evalToolbar">
+            <select
+              value={activeEvaluationDatasetId}
+              onChange={(event) => setActiveEvaluationDatasetId(event.target.value)}
+              disabled={!evaluationDatasets.length || evaluationBusy}
+            >
+              {evaluationDatasets.length === 0 && <option value="">暂无测评集</option>}
+              {evaluationDatasets.map((dataset) => (
+                <option key={dataset.id} value={dataset.id}>{dataset.name} · {dataset.case_count} 例</option>
+              ))}
+            </select>
+            <button type="button" onClick={createDefaultEvaluationDataset} disabled={!selectedId || evaluationBusy}>创建</button>
+            <button type="button" onClick={runEvaluationCenter} disabled={!activeEvaluationDatasetId || evaluationBusy}>
+              {evaluationBusy ? "运行中..." : "运行"}
+            </button>
+          </div>
+          {evaluationRun ? (
+            <>
+              <div className="qualityGrid">
+                <Metric label="Recall" value={formatMetric(evaluationRun.metrics.recall_at_k)} />
+                <Metric label="MRR" value={formatMetric(evaluationRun.metrics.mrr)} />
+                <Metric label="NDCG" value={formatMetric(evaluationRun.metrics.ndcg_at_k)} />
+                <Metric label="引用可读" value={formatMetric(evaluationRun.metrics.citation_readability)} />
+              </div>
+              <div className="evalFailureList">
+                {evaluationRun.results.filter((item) => !item.passed).slice(0, 4).map((item) => (
+                  <article className="gapItem" key={item.id}>
+                    <div><strong>失败样例</strong><span>{formatMetric(item.metrics?.recall_at_k)}</span></div>
+                    <p>{item.question}</p>
+                    {item.error_message && <small>{item.error_message}</small>}
+                  </article>
+                ))}
+                {evaluationRun.results.length > 0 && evaluationRun.results.every((item) => item.passed) && <div className="emptyHint">本轮测评未发现失败样例。</div>}
+              </div>
+            </>
+          ) : (
+            <div className="emptyHint">选择测评集后运行，查看 recall/MRR/NDCG/faithfulness/引用可读率。</div>
+          )}
+          {selectedGaps.length > 0 && (
+            <button className="textButton" type="button" onClick={() => addGapToEvaluation(selectedGaps[0])} disabled={!activeEvaluationDatasetId || evaluationBusy}>
+              将最新低证据问题加入测评集
+            </button>
+          )}
         </section>
       </aside>
 
@@ -832,6 +954,17 @@ function toAssistantMessage(response: ChatResponse): ChatMessage {
   };
 }
 
+function ensureAssistantMessage(items: ChatMessage[], assistantId: string, content: string) {
+  const updated = [...items];
+  const last = updated[updated.length - 1];
+  if (last && last.role === "assistant") {
+    last.content = content;
+  } else {
+    updated.push({ id: assistantId, role: "assistant", content });
+  }
+  return updated;
+}
+
 function parseTags(value: string) {
   return value.split(",").map((tag) => tag.trim()).filter(Boolean);
 }
@@ -841,6 +974,11 @@ function safeDisplayText(value: string | null | undefined, fallback: string) {
   if (!text) return fallback;
   if (/\?{2,}/.test(text)) return fallback;
   return text;
+}
+
+function formatMetric(value: unknown) {
+  if (typeof value !== "number" || Number.isNaN(value)) return "0.000";
+  return value.toFixed(3);
 }
 
 function mergeAssistantContent(current: string, incoming: string) {
@@ -921,7 +1059,7 @@ function StatusPill({ icon, label }: { icon: React.ReactNode; label: string }) {
   return <span className="statusPill">{icon}{label}</span>;
 }
 
-function Metric({ label, value, tone }: { label: string; value: number; tone?: "warn" }) {
+function Metric({ label, value, tone }: { label: string; value: number | string; tone?: "warn" }) {
   return <div className={`miniMetric ${tone || ""}`}><span>{label}</span><strong>{value}</strong></div>;
 }
 

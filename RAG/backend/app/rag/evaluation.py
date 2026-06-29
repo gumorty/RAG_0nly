@@ -29,6 +29,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.models.entities import Answer, Collection, EvalCase, RetrievalTrace
+from app.rag.eval_metrics import retrieval_metrics
 from app.rag.schemas import RetrievalStrategy
 from app.ragflow.client import RagFlowClient
 
@@ -57,21 +58,22 @@ class EvaluationService:
             retrieved = self.retrieval.retrieve(collection_id, case.question, strategy, acl_principals=["public"])
             retrieved_ids = [chunk.chunk_id for chunk in retrieved]
             expected = set(case.expected_chunk_ids or [])
-            hits = [chunk_id for chunk_id in retrieved_ids if chunk_id in expected]
-            if hits:
+            metrics = retrieval_metrics(retrieved_ids, list(expected), k=max(strategy.final_top_k, 10))
+            if metrics.hit:
                 hit_count += 1
-                first_rank = min(retrieved_ids.index(chunk_id) + 1 for chunk_id in hits)
-                reciprocal_sum += 1.0 / first_rank
-            recall = len(hits) / len(expected) if expected else 0.0
-            recall_sum += recall
+                reciprocal_sum += metrics.mrr
+            recall_sum += metrics.recall_at_k
             results.append(
                 {
                     "case_id": case.id,
                     "question": case.question,
                     "expected_chunk_ids": list(expected),
                     "retrieved_chunk_ids": retrieved_ids,
-                    "hit": bool(hits),
-                    "recall": recall,
+                    "hit": metrics.hit,
+                    "recall": metrics.recall_at_k,
+                    "precision_at_k": metrics.precision_at_k,
+                    "mrr": metrics.mrr,
+                    "ndcg_at_k": metrics.ndcg_at_k,
                 }
             )
         total = len(cases)
@@ -115,22 +117,22 @@ class EvaluationService:
 
             retrieved_ids = [ch.chunk_id for ch in chunks]
             expected = set(case.expected_chunk_ids or [])
-            hits = [cid for cid in retrieved_ids if cid in expected]
-
-            if hits:
+            metrics = retrieval_metrics(retrieved_ids, list(expected), k=10)
+            if metrics.hit:
                 hit_count += 1
-                first_rank = min(retrieved_ids.index(cid) + 1 for cid in hits)
-                reciprocal_sum += 1.0 / first_rank
-            recall = len(hits) / len(expected) if expected else 0.0
-            recall_sum += recall
+                reciprocal_sum += metrics.mrr
+            recall_sum += metrics.recall_at_k
 
             results.append({
                 "case_id": case.id,
                 "question": case.question,
                 "expected_chunk_ids": list(expected),
                 "retrieved_chunk_ids": retrieved_ids,
-                "hit": bool(hits),
-                "recall": recall,
+                "hit": metrics.hit,
+                "recall": metrics.recall_at_k,
+                "precision_at_k": metrics.precision_at_k,
+                "mrr": metrics.mrr,
+                "ndcg_at_k": metrics.ndcg_at_k,
             })
 
         total = len(cases)

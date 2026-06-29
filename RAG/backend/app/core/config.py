@@ -72,6 +72,9 @@ class Settings(BaseSettings):
     mineru_timeout_seconds: int = Field(default=600, ge=30, le=3600)
     mineru_poll_interval_seconds: int = Field(default=5, ge=1, le=60)
     mineru_max_file_size_mb: int = Field(default=200, ge=1, le=200)
+    mineru_pdf_ocr_mode: str = Field(default="auto", pattern="^(auto|always|never)$")
+    table_row_index_enabled: bool = True
+    table_row_index_max_rows: int = Field(default=5000, ge=100, le=50000)
 
     sciverse_enabled: bool = False
     sciverse_base_url: str = "https://api.sciverse.space"

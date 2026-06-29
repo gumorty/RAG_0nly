@@ -1,356 +1,472 @@
-# RAG 系统全面分析报告
+# RAG 知识库管理系统 — 深度分析与 Docker 部署指南
 
-> 分析时间：2026-06-21
-> 分析范围：Docker 运行状态、数据库数据、服务日志、代码架构、设计文档
-
----
-
-## 一、Docker 服务运行状态
-
-| 服务 | 镜像 | 状态 | 端口映射 | 运行时长 |
-|-----|------|:----:|---------|---------|
-| PostgreSQL | postgres:16 | healthy | 0.0.0.0:5432 | 41小时 |
-| Redis | redis:7 | 正常 | 6379（未暴露到宿主机） | 41小时 |
-| Qdrant | qdrant:v1.12.5 | 正常 | 6333-6334（未暴露到宿主机） | 33分钟（重启过） |
-| MinIO | minio | 正常 | 0.0.0.0:9100/9101 | 3小时（重启过） |
-| API | rag-api (FastAPI) | 正常 | 0.0.0.0:8010 | 1小时（重启过） |
-| Worker | rag-worker (Celery) | 正常 | 无 | 33分钟（重启过） |
-| Frontend | rag-frontend (Next.js) | 正常 | 0.0.0.0:4070 | 1小时（重启过） |
-
-### 基础设施问题
-
-1. **Qdrant 端口未暴露**：`docker-compose.yml` 没有把 6333 映射到宿主机，外部无法直接访问 Qdrant 面板。Docker 内部通信正常，但排障不方便。
-2. **Redis 端口未暴露**：6379 未映射到宿主机。
-3. **前端端口不一致**：`docker-compose.yml` 写的是 `3010:3000`，但实际运行在 **4070:3000**。可能是容器启动后修改了 compose 文件。
-4. **服务重启过**：Qdrant、Worker、API、Frontend 都重启过，而 PostgreSQL 和 Redis 已稳定运行 41 小时。说明基础设施稳定，应用层有过重启。
+> 分析时间: 2026-06-28 17:11 | 系统版本: 0.2.0
 
 ---
 
-## 二、数据库实际数据
-
-### 核心数据
-
-| 表 | 数量 | 说明 |
-|---|:---:|------|
-| collections | 3 | 实验室周会知识库、WordFile验收知识库、RAGFlow验收知识库 |
-| documents | 7 | 5个有chunk，**2个为0 chunk但状态=ready** |
-| chunks | 61 | 实际存储在 PostgreSQL |
-| answers | 24 | 全部通过 `qwen3.7-plus via RAGFlow retrieval` 生成 |
-| retrieval_traces | 27 | 比 answer 多 3 条（可能有查询未生成回答） |
-| eval_cases | **0** | **从未创建过评估用例** |
-| import_batches | **0** | **从未使用过 ZIP 批量导入** |
-| audit_logs | 81 | 操作审计记录完整 |
-| users | 4 | 1个admin + 3个member |
-| model_configs | 4 | DeepSeek、Codex、Mock兜底、qwen3.7-plus（当前激活） |
-| rag_strategy_presets | 1 | "Hybrid Baseline"（默认策略） |
-
-### 文档详细状态
-
-| 文档 | 集合 | 状态 | 实际 Chunk | 分析 Chunk | 质量告警 |
-|-----|------|:----:|:---------:|:---------:|---------|
-| 顾建伟6-17周 报.docx | 实验室周会知识库 | ready | 6 | 6 | many_tiny_chunks_possible |
-| 1.txt | WordFile验收知识库 | ready | 14 | 14 | many_tiny_chunks_possible |
-| 传感器平台 API 文档.docx | WordFile验收知识库 | ready | 8 | 8 | many_tiny_chunks_possible |
-| 科技论文-212509020046-顾建伟.pdf | WordFile验收知识库 | ready | 13 | 13 | many_tiny_chunks_possible |
-| 科技论文-212509020046-顾建伟.doc | WordFile验收知识库 | ready | 20 | 20 | 无 |
-| Engineering_Ethics_Sensor_Fusion_Paper.docx | RAGFlow验收知识库 | ready | **0** | 11 | 无 |
-| 顾建伟6-17周 报.docx | RAGFlow验收知识库 | ready | **0** | 12 | 无 |
-
-### 严重数据问题
-
-**RAGFlow 验收知识库中有 2 个文档：状态=ready 但实际 chunk=0。**
-
-分析报告中说分别有 11 和 12 个 chunk，但 PostgreSQL 里一个都没有。这是一个 Pipeline 数据完整性 Bug：`IngestionPipeline` 在 `document.status = ready` 和 `db.commit()` 之前，如果 Qdrant upsert 失败或连接中断，会导致分析记录已写入但 chunk 丢失。
-
----
-
-## 三、用户使用情况分析
-
-### 操作审计
-
-| 操作 | 次数 | 说明 |
-|-----|:---:|------|
-| chat.query | 37 | 提问了 37 次（24 条生成了回答） |
-| document.reindex | **17** | 重新索引 17 次（异常偏高，说明索引经常出问题） |
-| document.upload | 12 | 上传了 12 个文档（现存 7 个，删除过 2 个） |
-| collection.create | 7 | 创建过 7 个集合（现存 3 个） |
-| model_config.create | 4 | 配置了 4 个模型 |
-| model_config.activate | 2 | 切换了 2 次激活模型 |
-
-### 回答质量
-
-| 指标 | 数值 | 评估 |
-|-----|------|------|
-| 总回答数 | 24 | — |
-| 证据分 = 0 | 4 条 | 严重问题，检索完全没找到相关内容 |
-| 证据分 < 0.22 | 8 条（33%） | 按设计应该被拒绝回答 |
-| 最高证据分 | 0.42 | 仅一篇周报的精准提问达到 |
-| 平均证据分 | ~0.25 | 整体偏低 |
-| 用户反馈 | 全部为空 | 从未使用过反馈功能 |
-
-### 回答样例分析
-
-最近的提问集中在论文实验问题：
-
-| 问题 | 证据分 | 模型 |
-|-----|:------:|------|
-| 我这个知识库里面关于我的论文实验这一块遇到了什么问题？ | 0.289 | qwen3.7-plus |
-| 对于这些问题我给出的解决方法是什么？ | 0.310 | qwen3.7-plus |
-| 是我的论文实验中遇到的问题不是部署平台遇到的问题 | 0.329 | qwen3.7-plus |
-| 在顾建伟6-17周 报中他主要完成了什么任务，下周的计划是什么？ | 0.422 | qwen3.7-plus |
-| 这个知识库里最近的项目进展是什么？ | 0.000~0.210 | qwen3.7-plus |
-
-证据分偏低的原因：当前使用 hash embedding（不是真实语义向量），语义匹配能力很弱，主要靠 sparse keyword 兜底。
-
----
-
-## 四、系统架构全景
+## 一、系统架构总览
 
 ```
-┌──────────────────────────────────────────────────────────────────────┐
-│                        Frontend (Next.js :4070)                      │
-│  集合管理 · 文档上传 · 质量看板 · 问答对话 · 会议纪要 · 知识缺口 · 策略对比  │
-└───────────────────────────────┬──────────────────────────────────────┘
-                                │ REST API
-┌───────────────────────────────┴──────────────────────────────────────┐
-│                     API Server (FastAPI :8010)                       │
-│  /api/collections  /api/documents  /api/chat  /api/eval  /api/admin  │
-├──────────────────────────────────────────────────────────────────────┤
-│  Auth (JWT + API Key)  ·  RBAC (admin/maintainer/member/viewer)     │
-│  ACL 文档级权限  ·  AuditLog 操作审计  ·  ModelConfig 热切换模型     │
-└──────┬──────────┬──────────┬──────────┬─────────────────────────────┘
-       │          │          │          │
-  ┌────┴───┐ ┌───┴────┐ ┌───┴────┐ ┌───┴────┐
-  │PostgreSQL│ │ Redis  │ │ Qdrant │ │ MinIO  │
-  │ 主数据库 │ │消息队列│ │向量存储│ │对象存储│
-  └──────────┘ └───┬────┘ └────────┘ └────────┘
-                   │
-           ┌───────┴───────┐
-           │ Worker (Celery)│
-           │ 异步文档处理    │
-           └────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│                          用户浏览器                                      │
+│                     http://localhost:14070                              │
+└──────────────────────────┬──────────────────────────────────────────────┘
+                           │
+┌──────────────────────────▼──────────────────────────────────────────────┐
+│                        管理系统 (rag_default 网络)                       │
+│                                                                         │
+│  ┌──────────────┐    ┌──────────────────┐    ┌──────────────────────┐   │
+│  │  rag-frontend │───▶│    rag-api       │───▶│   rag-postgres       │   │
+│  │  Next.js 15   │    │  FastAPI 0.115   │    │  PostgreSQL 16       │   │
+│  │  port 14070   │    │  port 8010       │    │  用户/知识库/文档    │   │
+│  └──────────────┘    └───────┬──────────┘    └──────────────────────┘   │
+│                              │                                          │
+│              ┌───────────────┼───────────────┐                          │
+│              ▼               ▼               ▼                          │
+│  ┌─────────────────┐ ┌────────────┐ ┌──────────────────┐               │
+│  │  rag-redis       │ │ rag-minio  │ │  LLM (外部)      │               │
+│  │  Redis 7         │ │ MinIO      │ │  阿里云百炼      │               │
+│  │  消息/缓存       │ │ 对象存储   │ │  qwen3.7-plus    │               │
+│  └─────────────────┘ └────────────┘ └──────────────────┘               │
+│                                                                         │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │  rag-api 同时连接 ragflow 网络 → 直接访问 RAGFlow 服务           │   │
+│  │  不再需要 host.docker.internal 中转                             │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────┬──────────────────────────────────────┘
+                                  │
+      ┌───────────────────────────┼───────────────────────────┐
+      │    docker_ragflow 网络    │   (外部网络)               │
+      │                           │                            │
+      ▼                           ▼                            ▼
+┌──────────────┐     ┌──────────────────┐     ┌────────────────────┐
+│ ragflow-gpu  │────▶│   docker-es01    │     │  docker-mysql      │
+│ RAGFlow      │     │  Elasticsearch   │     │  MySQL 8.0         │
+│ v0.26.1      │     │  8.11.3          │     │  RAGFlow 元数据    │
+│ port 19380   │     │  port 1200       │     │  port 13306        │
+└──────┬───────┘     └──────────────────┘     └────────────────────┘
+       │
+       ▼
+┌──────────────────┐     ┌────────────────────┐
+│  docker-minio    │     │  docker-redis      │
+│  MinIO           │     │  Valkey 8          │
+│  文档缓存        │     │  RAGFlow 缓存      │
+│  port 19000      │     │  port 6379         │
+└──────────────────┘     └────────────────────┘
 ```
-
-### 12 张数据表
-
-| 表 | 职责 |
-|---|------|
-| users | 用户 + RBAC 角色 + JWT 认证 |
-| collections | 知识集合 |
-| documents | 文档元数据 + 状态机 |
-| chunks | 文本块 + 向量 ID + 稀疏词 + 层级路径 |
-| import_batches | ZIP 批量导入报告 |
-| retrieval_traces | 检索过程完整追踪 |
-| rag_strategy_presets | 可配置的检索策略预设 |
-| model_configs | LLM 模型热切换配置 |
-| answers | 回答 + 引用 + 证据分 + 用户反馈 |
-| eval_cases | 检索评估基准用例 |
-| audit_logs | 全操作审计日志 |
 
 ---
 
-## 五、文档处理链（Ingestion Pipeline）
-
-核心在 `pipeline.py` 的 `IngestionPipeline.run()`，是一个 6 步串行流水线。
-
-### 状态机
+## 二、项目源码结构
 
 ```
-Document.status:
-  uploaded → parsing → indexing → ready
-                                  ↘ failed (任何异常)
+RAG/
+├── .env                          # 环境变量配置（核心）
+├── docker-compose.yml            # Docker Compose 编排
+├── backend/                      # Python FastAPI 后端
+│   ├── Dockerfile                # 后端容器构建
+│   ├── requirements.txt          # Python 依赖
+│   ├── app/
+│   │   ├── main.py               # 应用入口（FastAPI lifespan + CORS）
+│   │   ├── core/
+│   │   │   ├── config.py         # 配置中心（所有环境变量定义）
+│   │   │   ├── db.py             # 数据库初始化
+│   │   │   └── security.py       # JWT 认证
+│   │   ├── api/
+│   │   │   ├── routes.py         # 所有 REST API 路由
+│   │   │   ├── schemas.py        # Pydantic 请求/响应模型
+│   │   │   └── deps.py           # 依赖注入
+│   │   ├── models/
+│   │   │   └── entities.py       # SQLAlchemy 实体模型
+│   │   ├── rag/                  # 自研 RAG 管线（legacy）
+│   │   │   ├── pipeline.py       # 文档处理管线
+│   │   │   ├── chunking.py       # 分块策略
+│   │   │   ├── embeddings.py     # Embedding 客户端
+│   │   │   ├── retrieval.py      # 混合检索
+│   │   │   ├── reranker.py       # 重排序
+│   │   │   ├── llm.py            # LLM 客户端
+│   │   │   ├── evaluation.py     # RAG 评估
+│   │   │   ├── parsers.py        # 文档解析器
+│   │   │   ├── vector_store.py   # 向量存储（Qdrant）
+│   │   │   ├── normalize.py      # 文本规范化
+│   │   │   ├── analysis.py       # 文档分析
+│   │   │   └── schemas.py        # 数据模型
+│   │   ├── ragflow/              # RAGFlow 集成层（新增）
+│   │   │   ├── client.py         # RAGFlow API 客户端
+│   │   │   ├── agent.py          # RAGFlow Agent (Canvas DAG)
+│   │   │   └── chunk_method.py   # 分块方法映射
+│   │   ├── services/             # 业务服务层
+│   │   │   ├── chat.py           # 问答服务
+│   │   │   ├── storage.py        # 对象存储服务
+│   │   │   ├── batch_ingest.py   # 批量导入
+│   │   │   ├── web_ingest.py     # 网页导入
+│   │   │   ├── parser_router.py  # 解析器路由（新增）
+│   │   │   ├── document_normalize.py  # 文档规范化（新增）
+│   │   │   ├── document_quality.py    # 文档质量评分（新增）
+│   │   │   ├── mineru.py         # MinerU 解析集成（新增）
+│   │   │   ├── sciverse.py       # SciVerse 学术搜索（新增）
+│   │   │   └── ragflow_session.py     # RAGFlow 会话管理（新增）
+│   │   └── workers/              # 后台工作器
+│   │       ├── celery_app.py     # Celery 配置（legacy）
+│   │       ├── tasks.py          # Celery 任务（legacy）
+│   │       ├── ragflow_ingestion.py   # RAGFlow 摄入监控（新增）
+│   │       └── migrate_ragflow_ids.py # 数据迁移脚本（新增）
+│   └── tests/                    # 测试用例
+├── frontend/                     # Next.js 前端
+│   ├── Dockerfile                # 前端容器构建
+│   ├── package.json              # Node 依赖
+│   ├── app/
+│   │   ├── page.tsx              # 主页面（知识库对话）
+│   │   ├── layout.tsx            # 根布局
+│   │   ├── api.ts                # API 客户端
+│   │   ├── types.ts              # TypeScript 类型
+│   │   └── styles.css            # 全局样式
+│   └── public/
+│       └── rag.png               # Logo
+├── docs/                         # 设计文档
+│   ├── RAGFlow集成部署说明.md
+│   ├── RAGFlow链路与企业级评估.md
+│   ├── RAG智能体上下文记忆方案.md
+│   ├── ARCHITECTURE_DECISION.md
+│   ├── DEPLOYMENT.md
+│   └── RAG_SYSTEM_DESIGN.md
+├── scripts/                      # 运维脚本
+│   ├── start-all.ps1             # 一键启动
+│   ├── stop-all.ps1              # 一键停止
+│   └── status-all.ps1            # 状态检查
+└── evalsets/                     # 评估数据集
+    └── lab_weekly_rag_eval.json
 ```
-
-### Step 1 — 接入
-
-三种入口统一汇入 `routes.py`：
-
-| 入口 | 接口 | 特殊处理 |
-|-----|------|---------|
-| 文件上传 | POST /collections/{id}/documents | SHA-256 去重 |
-| URL 导入 | POST /collections/{id}/url-documents | httpx 抓取 + HTML 标题提取 |
-| ZIP 批量 | POST /collections/{id}/batch-zip | 过滤 __MACOSX、.DS_Store、隐藏文件 |
-
-所有文件存入 MinIO 对象存储，元数据写入 PostgreSQL。
-
-### Step 2 — 解析
-
-`parsers.py` 按后缀分发解析器：
-
-| 类型 | 解析器 | 提取策略 | 图片处理 |
-|-----|-------|---------|:------:|
-| PDF | pypdf | 逐页抽取 + [Page N] 标记 | 忽略 |
-| Word | python-docx | 段落 + 表格（管道分隔） | 忽略 |
-| PPT | python-pptx | 逐 Slide 抽取 shape.text | 忽略 |
-| Excel | openpyxl | 按 Sheet 逐行（管道分隔） | N/A |
-| HTML | BeautifulSoup + markdownify | 去 script/style → 转 Markdown | 保留 alt |
-| 文本类 | chardet 编码探测 | UTF-8 → UTF-8-sig → 自动探测 | N/A |
-
-解析后通过 `_extract_sections()` 按 `#` 标题和冒号结尾标题做章节识别。
-
-### Step 3 — 清洗
-
-`normalize.py` 做 5 项统一处理：
-
-1. CRLF/CR → LF
-2. Tab + NBSP → 普通空格
-3. 行首行尾空格清理
-4. 连续空行压缩为双换行
-5. 连续空格压缩为单空格
-
-### Step 4 — 分块
-
-`chunking.py` 的 `HierarchicalChunker`，三级切分策略：
-
-```
-Level 1: 按章节（title_path）遍历
-Level 2: 按段落（\n\n 分隔）累积 token，超过 600 切块
-Level 3: 超长段落按句（。！？.!?）切分
-```
-
-- 重叠窗口：overlap_tokens=100
-- token 估算：中文 × 0.8 + 英文词 × 1.2 + 标点 × 0.2
-- 每个 chunk 携带：原始内容、归一化内容、title_path、token_count、section 元数据
-
-### Step 5 — 质量分析
-
-`analysis.py` 生成分析报告：
-
-- 字符数、token 数、chunk 统计（min/max/avg）
-- Top 30 稀疏词
-- 6 种质量告警
-- 实验周报信号抽取（进展、风险、下一步、决策、负责人）
-
-### Step 6 — 向量化 + 索引
-
-- 稠密向量：通过 `embeddings.py` 生成，写入 `vector_store.py` 的 Qdrant（余弦相似度）
-- 稀疏词索引：`tokenize_for_sparse()` 生成中英文 n-gram，存入 PostgreSQL 的 chunks.sparse_terms
-- content_hash：每个 chunk 的 SHA-256，用于去重
 
 ---
 
-## 六、检索与回答链
+## 三、数据流详解
 
-### 检索全流程
+### 3.1 文档上传 → 解析 → 索引
 
 ```
-用户提问
-  │
-  ▼
-① 查询改写（LLM rewrite_query）
-  │
-  ▼
-② 稠密向量检索（Qdrant 余弦相似度）→ top-30 + ACL 过滤
-  │
-  ▼
-③ 关键词检索（PostgreSQL sparse_terms 匹配）→ top-30
-  │
-  ▼
-④ RRF 融合（Reciprocal Rank Fusion）→ 1/(60+rank)
-  │
-  ▼
-⑤ 重排（ScoreFusionReranker: 0.65×dense + 0.35×keyword）
-  │
-  ▼
-⑥ 取 final_top_k=8 + 上下文扩展（前后各 1 chunk 拼接）
-  │
-  ▼
-⑦ 证据门槛判断 → max(score) < 0.22 则拒绝回答
-  │
-  ▼
-⑧ LLM 带引用回答 → 存 RetrievalTrace + Answer
+前端上传文件
+    │
+    ▼
+POST /api/upload  (routes.py)
+    │
+    ▼
+_ingest_with_ragflow_or_local()
+    │
+    ├── [RAGFlow 路径] ──────────────────────────────────────
+    │   │
+    │   ▼
+    │   prepare_for_ragflow()  ← parser_router.py
+    │   │   │
+    │   │   ├── score_ingest_candidate()  ← 质量评分
+    │   │   ├── [MinerU 可选] 调用 MinerU API 精解
+    │   │   │   │  失败时降级到 normalize
+    │   │   └── normalize_for_ragflow()   ← 格式转换
+    │   │       .xlsx/.xls → Markdown 表格
+    │   │       .html     → Markdown 正文
+    │   │       .pptx     → 逐页文本
+    │   │       .csv      → Markdown 表格
+    │   │
+    │   ▼
+    │   RagFlowClient.upload_document(dataset_id, file)
+    │   RagFlowClient.parse_documents(dataset_id, [doc_id])
+    │       ▶ RAGFlow DeepDOC 解析
+    │       ▶ text-embedding-v4 Embedding
+    │       ▶ Elasticsearch 索引
+    │   start_background_monitor()  ← 后台轮询解析进度
+    │
+    └── [本地路径] ──────────────────────────────────────────
+        (legacy-local-rag profile, 默认不启用)
+        _schedule_ingestion()
+        ▶ IngestionPipeline.run()
+        ▶ Qdrant 存储
 ```
 
-### 当前 Embedding 配置
+### 3.2 问答流程
 
-| 配置项 | 当前值 | 说明 |
-|-------|-------|------|
-| EMBEDDING_PROVIDER | hash | 哈希伪向量，非真实语义 |
-| EMBEDDING_MODEL | hash-384 | 384维 hash embedding |
-| ENABLE_RERANKER | false | CrossEncoder 重排未开启 |
-
----
-
-## 七、安全与权限模型
-
-### 认证方式
-
-- JWT Bearer Token：access_token（30分钟）+ refresh_token（7天），支持 token_version 强制下线
-- API Key：X-API-Key header，SHA-256 存储
-
-### RBAC 角色（4 级）
-
-| 角色 | 权限 |
-|-----|------|
-| admin | 全部操作 |
-| maintainer | 管理文档/策略/评估 |
-| member | 上传文档、提问 |
-| viewer | 只读 |
-
-### ACL 文档级权限
-
-每个 document 有 acl 列表，检索时按 `_document_allowed()` 过滤。
-
----
-
-## 八、当前系统优势
-
-1. **完整的治理闭环**：接入→解析→清洗→分块→检索→回答→评估→缺口→再优化
-2. **可追溯性强**：每个 chunk 有 title_path、content_hash、ordinal；每次回答有 RetrievalTrace + citations
-3. **策略可配置**：RagStrategyPreset 支持多套检索策略预设
-4. **混合检索 + RRF 融合**：dense + keyword 互补
-5. **模型热切换**：ModelConfig 可以不重启切换 LLM
-6. **ACL + RBAC 双层权限**
-7. **质量看板**：collection_quality 聚合分析报告
+```
+前端发起问答 (POST /api/chat)
+    │
+    ▼
+ChatService.ask()
+    │
+    ├── [RAGFlow 路径] ─────────────────────────────────────
+    │   │
+    │   ├── [Agent 模式] ragflow_enable_agent=True
+    │   │   RagflowAgentClient.execute_agent()
+    │   │   ▶ RAGFlow Canvas DAG 执行
+    │   │
+    │   ├── [Chat Completions 模式] enable_chat_completions=True
+    │   │   RagFlowClient.create_session(chat_id)
+    │   │   RagFlowClient.chat_completions(session_id, messages)
+    │   │   ▶ RAGFlow 内部调用 LLM + 引用
+    │   │
+    │   └── [Retrieval 模式] (默认)
+    │       RagFlowClient.retrieve(dataset_id, query)
+    │       ▶ ES 混合检索
+    │       ▶ 返回证据 chunks
+    │       LLMClient.answer(context, query)
+    │       ▶ 阿里云百炼 qwen3.7-plus
+    │       ▶ 基于证据生成回答
+    │
+    └── [本地路径] ──────────────────────────────────────────
+        Qdrant 检索 + BM25 关键词 + Reranker
+```
 
 ---
 
-## 九、当前系统局限与改进方向
+## 四、Docker 部署架构
 
-| 局限 | 影响 | 建议改进 |
-|-----|------|---------|
-| 无 OCR/图表理解 | PDF 扫描件、嵌入图片、图表全部丢失 | 接入 PaddleOCR / 多模态模型 |
-| Embedding 精度 | hash embedding 是伪语义 | 切换 BAAI/bge-m3 或 OpenAI embedding |
-| 关键词检索线性扫描 | O(n) 遍历全 collection | 接入 BM25 / OpenSearch / pgvector sparse |
-| 章节识别过于简单 | 只识别 # 和冒号标题 | 接入 unstructured 库 |
-| 无增量索引 | 文档更新需全量重新解析 | 添加文档版本 + diff-based reindex |
-| 无敏感数据检测 | PII 直接进入索引 | 添加 PII 检测 + 脱敏 pipeline |
-| token 估算是启发式 | 中文×0.8 粗略估算 | 接入 tiktoken |
-| Reranker 默认关闭 | 线性加权不如 CrossEncoder | 开启 BAAI/bge-reranker-v2-m3 |
-| Pipeline chunk 丢失 | 2 个文档 0 chunk 但 ready | 修复 IngestionPipeline 回滚逻辑 |
+### 4.1 当前运行容器（10 个容器）
+
+| 容器名 | 镜像 | 端口映射 | 状态 |
+|--------|------|---------|------|
+| **管理系统** | | | |
+| `rag-api-1` | rag-api (自建) | 8010:8000 | Up 1h |
+| `rag-frontend-1` | rag-frontend (自建) | 14070:3000 | Up 2h |
+| `rag-postgres-1` | postgres:16 | 5432:5432 | healthy |
+| `rag-redis-1` | redis:7 | - | Up 4h |
+| `rag-minio-1` | minio/minio | 19100:9000, 19101:9001 | Up 4h |
+| **RAGFlow** | | | |
+| `docker-ragflow-gpu-1` | infiniflow/ragflow:v0.26.1 | 19380:9380 | Up 4h |
+| `docker-es01-1` | elasticsearch:8.11.3 | 1200:9200 | healthy |
+| `docker-mysql-1` | mysql:8.0.39 | 13306:3306 | healthy |
+| `docker-minio-1` | pgsty/minio | 19000:9000, 19001:9001 | healthy |
+| `docker-redis-1` | valkey/valkey:8 | 6379:6379 | healthy |
+
+### 4.2 网络拓扑
+
+```
+rag_default 网络 (172.21.0.0/16)
+├── rag-api-1 *
+├── rag-frontend-1
+├── rag-postgres-1
+├── rag-redis-1
+└── rag-minio-1
+
+docker_ragflow 网络 (172.20.0.0/16)
+├── rag-api-1 *  ──── 桥接节点
+├── docker-ragflow-gpu-1
+├── docker-es01-1
+├── docker-mysql-1
+├── docker-minio-1
+└── docker-redis-1
+
+* rag-api-1 同时连接两个网络
+```
+
+### 4.3 端口映射
+
+| 外部端口 | 内部端口 | 服务 | 说明 |
+|---------|---------|------|------|
+| 8010 | 8000 | 管理 API | FastAPI 后端 |
+| 14070 | 3000 | 管理前端 | Next.js 控制台 |
+| 5432 | 5432 | 管理 PostgreSQL | 元数据存储 |
+| 19100 | 9000 | 管理 MinIO API | 对象存储 |
+| 19101 | 9001 | 管理 MinIO Console | 管理界面 |
+| 19380 | 9380 | RAGFlow API | RAG 引擎 API |
+| 18080 | 80 | RAGFlow Web | RAGFlow 管理界面 |
+| 1200 | 9200 | Elasticsearch | 向量+全文检索 |
+| 13306 | 3306 | RAGFlow MySQL | 内部状态 |
+| 19000 | 9000 | RAGFlow MinIO | 文件缓存 |
+| 6379 | 6379 | RAGFlow Valkey | 缓存 |
 
 ---
 
-## 十、项目阶段判定
+## 五、如何更新代码并推送到 Docker
 
-根据 ARCHITECTURE_DECISION.md 的三阶段规划：
+### 完整工作流（三步）
 
-| 阶段 | 目标 | 完成度 |
-|-----|------|:------:|
-| 第一阶段 | Docker 稳定启动 + 登录/导入/索引/检索/问答/摘要/缺口闭环 | 85% |
-| 第二阶段 | 接入 bge-m3 embedding + reranker + 离线评估 + 策略对比 | 0% |
-| 第三阶段 | 企业 SSO + 租户隔离 + 连接器 | 0% |
+#### 步骤 1：修改代码
 
-### 第一阶段完成项
+在项目目录下修改源码：
+```powershell
+cd D:\Researching\LLMStart\RAG
+# 修改 backend/app/ 下的 Python 文件
+# 或修改 frontend/app/ 下的前端代码
+```
 
-| 功能 | 状态 | 备注 |
-|-----|:----:|------|
-| Docker Compose 启动 | 通过 | 7 个容器全部运行 |
-| JWT 登录/认证 | 通过 | 日志中有 401 + refresh_token 记录 |
-| 文档上传 | 通过 | 支持 Word/PDF/TXT/DOC |
-| 解析 + 分块 | 通过 | 5/7 文档正常分块 |
-| 混合检索 + 问答 | 通过 | 已接入 qwen3.7-plus 真实模型 |
-| 知识缺口沉淀 | 通过 | 代码已就绪，有低证据回答 |
-| 模型热切换 | 通过 | 从 Mock 切换到 qwen3.7-plus |
-| 质量分析 | 通过 | 每个文档有分析报告 |
-| ZIP 批量导入 | 未使用 | 代码就绪但从未调用 |
-| 评估用例 | 未使用 | 代码就绪但从未创建 |
-| 用户反馈 | 未使用 | 代码就绪但从未触发 |
+#### 步骤 2：重建并重启具体容器
+
+**选项 A：仅重启 API（最快，推荐开发阶段）**
+```powershell
+docker compose up -d --build api
+```
+- 重新构建 `rag-api` 镜像
+- 重启 API 容器
+- frontend、postgres、redis、minio 不受影响
+
+**选项 B：重启前端**
+```powershell
+docker compose up -d --build frontend
+```
+- 重新构建 `rag-frontend` 镜像
+- 重启前端容器
+
+**选项 C：重启所有管理系统**
+```powershell
+.\scripts\start-all.ps1
+```
+- 执行 `start-all.ps1` 脚本
+- 先启动 RAGFlow（如果未运行）
+- 移除 legacy 容器
+- 重建并启动所有管理服务
+
+**选项 D：逐容器单独重建（最精确）**
+```powershell
+docker compose build api                # 仅构建（不重启）
+docker compose up -d api                # 仅重启（用已有镜像）
+docker compose up -d --build api        # 构建+重启一步完成
+```
+
+#### 步骤 3：验证运行状态
+
+```powershell
+# 检查容器状态
+docker compose ps
+
+# 检查日志
+docker compose logs api --tail 30
+docker compose logs frontend --tail 30
+
+# 检查 API 健康
+curl http://localhost:8010/api/health
+
+# 检查前端
+curl -o /dev/null -s -w "%{http_code}" http://localhost:14070
+
+# 检查 RAGFlow 连通性
+curl http://localhost:19380/api/v1/system/status
+```
+
+### 后端代码变更后的典型操作
+
+```
+修改了 Python 代码 (routes.py, services/chat.py 等)
+    │
+    ▼
+docker compose up -d --build api
+    │
+    ▼
+等待 API 启动（约 5-10 秒）
+    │
+    ▼
+curl http://localhost:8010/api/health
+    → {"status":"ok"}
+    │
+    ▼
+打开浏览器 http://localhost:14070 验证功能
+```
+
+### 前端代码变更后的典型操作
+
+```
+修改了前端代码 (page.tsx, styles.css 等)
+    │
+    ▼
+docker compose up -d --build frontend
+    │
+    ▼
+等待前端编译完成（约 10-20 秒）
+    │
+    ▼
+刷新浏览器 http://localhost:14070 验证
+```
+
+### 依赖变更（requirements.txt 更新后）
+
+```
+更新了 requirements.txt (新增/升级 Python 包)
+    │
+    ▼
+docker compose build api --no-cache     # 强制无缓存构建
+docker compose up -d api                # 启动新容器
+```
+
+### 环境变量变更（.env 更新后）
+
+```
+修改了 .env 文件
+    │
+    ▼
+docker compose down api                 # 停止旧容器
+docker compose up -d api                # 自动加载新 .env
+# 注: docker compose down 会删除容器但保留卷
+```
 
 ---
 
-## 十一、最紧迫的 3 件事
+## 六、完整启动流程（从零开始）
 
-1. **修复 Pipeline chunk 丢失 Bug**：检查 `IngestionPipeline.run()` 中 Qdrant upsert 失败时的回滚逻辑，确保 status=ready 一定有对应 chunk
-2. **替换 hash embedding**：切换到 local 模式使用 BAAI/bge-m3，这是提升检索质量最直接的手段
-3. **建立评估基线**：创建 10-20 个 EvalCase，跑一次 retrieval_eval，得到 Hit Rate/MRR/Recall 基线数据
+### 首次部署
+
+```powershell
+# 1. 启动 RAGFlow 引擎
+cd D:\Researching\LLMStart\RAG\external-repos\ragflow\docker
+docker compose --profile elasticsearch --profile gpu up -d
+
+# 2. 等待 RAGFlow 就绪（约 1-2 分钟，视硬件而定）
+#    确保 MySQL/ES/Redis/MinIO 全部 healthy
+
+# 3. 启动管理系统
+cd D:\Researching\LLMStart\RAG
+docker compose up -d --build postgres redis minio api frontend
+
+# 4. 验证所有服务
+docker compose ps
+curl http://localhost:8010/api/health
+```
+
+### 日常启动（已部署过）
+
+```powershell
+cd D:\Researching\LLMStart\RAG
+.\scripts\start-all.ps1
+```
+
+### 日常停止
+
+```powershell
+cd D:\Researching\LLMStart\RAG
+.\scripts\stop-all.ps1
+```
+
+---
+
+## 七、关键配置说明
+
+`.env` 文件中最重要的配置项：
+
+| 配置项 | 值 | 说明 |
+|--------|-----|------|
+| `RAGFLOW_ENABLED` | `true` | 启用 RAGFlow 集成 |
+| `RAGFLOW_BASE_URL` | `http://ragflow-gpu:9380/api/v1` | RAGFlow API 地址 |
+| `RAGFLOW_ENABLE_CHAT_COMPLETIONS` | `true` | 使用 RAGFlow chat 接口 |
+| `MINERU_ENABLED` | `true` | 启用 MinerU 精解 |
+| `SCIVERSE_ENABLED` | `true` | 启用 SciVerse 学术搜索 |
+| `LLM_BASE_URL` | `https://dashscope.aliyuncs.com/...` | 阿里云百炼 API |
+| `LLM_MODEL` | `qwen3.7-plus` | 通义千问大模型 |
+| `CORS_ALLOWED_ORIGINS` | `http://localhost:14070,...` | 前端跨域来源 |
+
+---
+
+## 八、常见问题
+
+### Q: API 容器启动后立即退出？
+A: 查看日志定位问题：`docker compose logs api`
+常见原因：PostgreSQL 未就绪、.env 配置错误、依赖缺失
+
+### Q: 前端白屏或 API 请求失败？
+A: 确认 CORS 配置包含前端地址：`.env` 中 `CORS_ALLOWED_ORIGINS`
+确认前端 `NEXT_PUBLIC_API_BASE_URL` 指向正确的 API 地址
+
+### Q: RAGFlow 文档解析一直 pending？
+A: 检查 RAGFlow 日志：`docker logs docker-ragflow-gpu-1 --tail 30`
+首次解析可能需要等待 Tika/torch 初始化
+
+### Q: 如何彻底清理重建？
+A: 
+```powershell
+docker compose down -v     # 删除容器+卷（数据会丢失！）
+docker compose up -d --build
+```

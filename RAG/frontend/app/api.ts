@@ -1,4 +1,4 @@
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8010";
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:18010";
 const ACCESS_TOKEN_KEY = "rag_access_token";
 const REFRESH_TOKEN_KEY = "rag_refresh_token";
 
@@ -23,6 +23,14 @@ function clearTokens() {
   window.localStorage.removeItem(REFRESH_TOKEN_KEY);
 }
 
+function apiConnectionError(error: unknown) {
+  return new Error(
+    `无法连接后端 API（${API_BASE}）。请确认 Docker 中 api 服务已启动并映射到 18010 端口。${
+      error instanceof Error ? `原始错误：${error.message}` : ""
+    }`
+  );
+}
+
 async function request<T>(path: string, init?: RequestInit, retry = true): Promise<T> {
   const headers = new Headers(init?.headers);
   const token = getAccessToken();
@@ -32,7 +40,7 @@ async function request<T>(path: string, init?: RequestInit, retry = true): Promi
     headers,
     cache: "no-store"
   }).catch((error) => {
-    throw new Error(`无法连接后端 API（${API_BASE}）。请确认 Docker 中 api 服务已启动并映射到 8010 端口。${error instanceof Error ? `原始错误：${error.message}` : ""}`);
+    throw apiConnectionError(error);
   });
   if (response.status === 401 && retry && getRefreshToken()) {
     const refreshed = await refreshSession().catch(() => null);
@@ -52,7 +60,7 @@ async function authRequest<T>(path: string, payload: Record<string, unknown>): P
     body: JSON.stringify(payload),
     cache: "no-store"
   }).catch((error) => {
-    throw new Error(`无法连接后端 API（${API_BASE}）。请确认 Docker 中 api 服务已启动并映射到 8010 端口。${error instanceof Error ? `原始错误：${error.message}` : ""}`);
+    throw apiConnectionError(error);
   });
   if (!response.ok) {
     throw new Error(await readError(response));
@@ -154,6 +162,27 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ strategies })
     }),
+  listEvaluationDatasets: (collectionId: string) =>
+    request<{ items: import("./types").EvaluationDataset[] }>(`/evaluation/datasets?collection_id=${collectionId}`),
+  createEvaluationDataset: (payload: { collection_id: string; name: string; description?: string }) =>
+    request<import("./types").EvaluationDataset>("/evaluation/datasets", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    }),
+  createEvaluationCase: (datasetId: string, payload: Record<string, unknown>) =>
+    request<{ id: string }>(`/evaluation/datasets/${datasetId}/cases`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    }),
+  runEvaluation: (datasetId: string, payload: Record<string, unknown> = {}) =>
+    request<import("./types").EvaluationRun>(`/evaluation/datasets/${datasetId}/runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    }),
+  getEvaluationRun: (runId: string) => request<import("./types").EvaluationRun>(`/evaluation/runs/${runId}`),
   uploadDocument: (collectionId: string, form: FormData) =>
     request<import("./types").DocumentItem>(`/collections/${collectionId}/documents`, {
       method: "POST",
@@ -235,7 +264,7 @@ export const api = {
                 onDone();
               }
             } catch {
-              // ignore parse errors
+              // Ignore malformed stream fragments.
             }
           }
         }

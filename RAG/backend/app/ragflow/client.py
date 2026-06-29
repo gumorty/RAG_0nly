@@ -96,6 +96,31 @@ class RagFlowClient:
         """PUT /datasets/<dataset_id> — update dataset config (chunk_method, parser_config, …)."""
         return self._request("PUT", f"/datasets/{dataset_id}", json=updates)["data"]
 
+    def ensure_dataset_embedding(self, dataset_id: str) -> dict:
+        """Ensure an existing dataset uses the configured embedding model.
+
+        RAGFlow stores the embedding model on each dataset. Changing the tenant
+        default later does not repair old datasets, so uploads can keep failing
+        with the previous exhausted embedding provider unless we reconcile here.
+        """
+        dataset = self.get_dataset(dataset_id)
+        current = str(
+            dataset.get("embedding_model")
+            or dataset.get("embd_id")
+            or dataset.get("embedding_id")
+            or ""
+        )
+        expected = self.settings.ragflow_embedding_model
+        if current == expected:
+            return dataset
+        logger.info(
+            "Updating RAGFlow dataset %s embedding model from %s to %s",
+            dataset_id,
+            current or "<empty>",
+            expected,
+        )
+        return self.update_dataset(dataset_id, embedding_model=expected)
+
     def delete_dataset(self, dataset_id: str) -> None:
         """DELETE /datasets — remove one dataset by id."""
         self._request("DELETE", "/datasets", json={"ids": [dataset_id]})

@@ -264,7 +264,7 @@ export const api = {
                 onDone();
               }
             } catch {
-              // Ignore malformed stream fragments.
+              // ignore parse errors
             }
           }
         }

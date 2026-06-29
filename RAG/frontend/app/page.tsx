@@ -438,10 +438,6 @@ export default function HomePage() {
       const controller = api.chatStream(
         { collection_id: selectedId, question: text, session_id: sessionId, history },
         (event) => {
-          if (event.error && !event.answer) {
-            setMessages((items) => ensureAssistantMessage(items, assistantId, event.error || "检索链路异常，本次问题没有生成回答。"));
-            setError(event.error);
-          }
           if (event.answer) {
             const answerText = event.answer;
             setMessages((items) => {
@@ -454,9 +450,6 @@ export default function HomePage() {
               }
               return updated;
             });
-          }
-          if (event.final && !event.answer && !event.reference?.chunks?.length && !event.error) {
-            setMessages((items) => ensureAssistantMessage(items, assistantId, "本次检索结束，但没有生成可展示的回答。请查看后台日志或稍后重试。"));
           }
           if (event.final && event.reference?.chunks) {
             const ragCitations = event.reference.chunks.map(normalizeCitation);
@@ -491,8 +484,6 @@ export default function HomePage() {
             const last = updated[updated.length - 1];
             if (last && last.role === "assistant") {
               last.content = errMsg;
-            } else {
-              updated.push({ id: assistantId, role: "assistant", content: errMsg });
             }
             return updated;
           });
@@ -570,6 +561,7 @@ export default function HomePage() {
       });
       setEvaluationDatasets((items) => [dataset, ...items.filter((item) => item.id !== dataset.id)]);
       setActiveEvaluationDatasetId(dataset.id);
+      setEvaluationRun(null);
       setNotice("测评集已创建，可以继续从低证据问题沉淀用例。");
     }, "创建测评集失败");
   }
@@ -726,53 +718,6 @@ export default function HomePage() {
             </div>
           </details>
         </section>
-
-        <section className="inspectorPanel">
-          <PanelTitle icon={<BrainCircuit size={18} />} title="测评中心" meta="召回、排序、引用质量回归" />
-          <div className="evalToolbar">
-            <select
-              value={activeEvaluationDatasetId}
-              onChange={(event) => setActiveEvaluationDatasetId(event.target.value)}
-              disabled={!evaluationDatasets.length || evaluationBusy}
-            >
-              {evaluationDatasets.length === 0 && <option value="">暂无测评集</option>}
-              {evaluationDatasets.map((dataset) => (
-                <option key={dataset.id} value={dataset.id}>{dataset.name} · {dataset.case_count} 例</option>
-              ))}
-            </select>
-            <button type="button" onClick={createDefaultEvaluationDataset} disabled={!selectedId || evaluationBusy}>创建</button>
-            <button type="button" onClick={runEvaluationCenter} disabled={!activeEvaluationDatasetId || evaluationBusy}>
-              {evaluationBusy ? "运行中..." : "运行"}
-            </button>
-          </div>
-          {evaluationRun ? (
-            <>
-              <div className="qualityGrid">
-                <Metric label="Recall" value={formatMetric(evaluationRun.metrics.recall_at_k)} />
-                <Metric label="MRR" value={formatMetric(evaluationRun.metrics.mrr)} />
-                <Metric label="NDCG" value={formatMetric(evaluationRun.metrics.ndcg_at_k)} />
-                <Metric label="引用可读" value={formatMetric(evaluationRun.metrics.citation_readability)} />
-              </div>
-              <div className="evalFailureList">
-                {evaluationRun.results.filter((item) => !item.passed).slice(0, 4).map((item) => (
-                  <article className="gapItem" key={item.id}>
-                    <div><strong>失败样例</strong><span>{formatMetric(item.metrics?.recall_at_k)}</span></div>
-                    <p>{item.question}</p>
-                    {item.error_message && <small>{item.error_message}</small>}
-                  </article>
-                ))}
-                {evaluationRun.results.length > 0 && evaluationRun.results.every((item) => item.passed) && <div className="emptyHint">本轮测评未发现失败样例。</div>}
-              </div>
-            </>
-          ) : (
-            <div className="emptyHint">选择测评集后运行，查看 recall/MRR/NDCG/faithfulness/引用可读率。</div>
-          )}
-          {selectedGaps.length > 0 && (
-            <button className="textButton" type="button" onClick={() => addGapToEvaluation(selectedGaps[0])} disabled={!activeEvaluationDatasetId || evaluationBusy}>
-              将最新低证据问题加入测评集
-            </button>
-          )}
-        </section>
       </aside>
 
       <section className="chatWorkspace" aria-label="知识库问答区">
@@ -884,6 +829,54 @@ export default function HomePage() {
         </section>
 
         <section className="inspectorPanel">
+          <PanelTitle icon={<BrainCircuit size={18} />} title="测评中心" meta="召回、排序、引用质量回归" />
+          <div className="evalToolbar">
+            <select
+              value={activeEvaluationDatasetId}
+              onChange={(event) => setActiveEvaluationDatasetId(event.target.value)}
+              disabled={!evaluationDatasets.length || evaluationBusy}
+            >
+              {evaluationDatasets.length === 0 && <option value="">暂无测评集</option>}
+              {evaluationDatasets.map((dataset) => (
+                <option key={dataset.id} value={dataset.id}>{dataset.name} · {dataset.case_count} 例</option>
+              ))}
+            </select>
+            <button type="button" onClick={createDefaultEvaluationDataset} disabled={!selectedId || evaluationBusy}>创建</button>
+            <button type="button" onClick={runEvaluationCenter} disabled={!activeEvaluationDatasetId || evaluationBusy}>
+              {evaluationBusy ? "运行中..." : "运行"}
+            </button>
+          </div>
+          {evaluationRun ? (
+            <>
+              {evaluationRun.metrics.message && <div className="emptyHint">{String(evaluationRun.metrics.message)}</div>}
+              <div className="qualityGrid">
+                <Metric label="Recall" value={formatMetric(evaluationRun.metrics.recall_at_k)} />
+                <Metric label="MRR" value={formatMetric(evaluationRun.metrics.mrr)} />
+                <Metric label="NDCG" value={formatMetric(evaluationRun.metrics.ndcg_at_k)} />
+                <Metric label="引用可读" value={formatMetric(evaluationRun.metrics.citation_readability)} />
+              </div>
+              <div className="evalFailureList">
+                {evaluationRun.results.filter((item) => !item.passed).slice(0, 4).map((item) => (
+                  <article className="gapItem" key={item.id}>
+                    <div><strong>失败样例</strong><span>{formatMetric(item.metrics?.recall_at_k)}</span></div>
+                    <p>{safeDisplayText(item.question, "问题文本不可读")}</p>
+                    {item.error_message && <small className="errorText">{summarizeError(item.error_message)}</small>}
+                  </article>
+                ))}
+                {evaluationRun.results.length > 0 && evaluationRun.results.every((item) => item.passed) && <div className="emptyHint">本轮测评未发现失败样例。</div>}
+              </div>
+            </>
+          ) : (
+            <div className="emptyHint">选择测评集后运行，查看 recall/MRR/NDCG/faithfulness/引用可读率。</div>
+          )}
+          {selectedGaps.length > 0 && (
+            <button className="textButton" type="button" onClick={() => addGapToEvaluation(selectedGaps[0])} disabled={!activeEvaluationDatasetId || evaluationBusy}>
+              将最新低证据问题加入测评集
+            </button>
+          )}
+        </section>
+
+        <section className="inspectorPanel">
           <PanelTitle icon={<PanelRightOpen size={18} />} title="资料摘要" meta={summary ? `${summary.document_count} 份可分析资料，全部来自文档抽取信号` : "等待文档分析"} />
           {!summary && <div className="emptyHint">暂无摘要。</div>}
           {summary && <>
@@ -954,17 +947,6 @@ function toAssistantMessage(response: ChatResponse): ChatMessage {
   };
 }
 
-function ensureAssistantMessage(items: ChatMessage[], assistantId: string, content: string) {
-  const updated = [...items];
-  const last = updated[updated.length - 1];
-  if (last && last.role === "assistant") {
-    last.content = content;
-  } else {
-    updated.push({ id: assistantId, role: "assistant", content });
-  }
-  return updated;
-}
-
 function parseTags(value: string) {
   return value.split(",").map((tag) => tag.trim()).filter(Boolean);
 }
@@ -979,6 +961,21 @@ function safeDisplayText(value: string | null | undefined, fallback: string) {
 function formatMetric(value: unknown) {
   if (typeof value !== "number" || Number.isNaN(value)) return "0.000";
   return value.toFixed(3);
+}
+
+function summarizeError(value: string | null | undefined) {
+  const text = (value || "").replace(/\s+/g, " ").trim();
+  if (!text) return "处理失败，未返回可读错误信息。";
+  if (text.includes("AllocationQuota.FreeTierOnly") || text.includes("free quota has been exhausted")) {
+    return "Embedding 模型额度不足或免费额度已耗尽，请切换到可用的 Embedding 模型后重新解析。";
+  }
+  if (text.includes("Fail to bind embedding model")) {
+    return "RAGFlow 无法绑定当前 Embedding 模型，请检查知识库的 Embedding 配置后重新解析。";
+  }
+  if (text.includes("doesn't own") || text.includes("not visible in the target dataset")) {
+    return "RAGFlow 文档与当前知识库不匹配，请删除该文档后重新上传。";
+  }
+  return text.length > 220 ? `${text.slice(0, 220)}...` : text;
 }
 
 function mergeAssistantContent(current: string, incoming: string) {
@@ -1104,6 +1101,7 @@ function CitationCard({ citation, index }: { citation: Citation; index: number }
 function DocumentRow({ document, busy, onDelete }: { document: DocumentItem; busy: boolean; onDelete: (id: string) => void }) {
   const progress = Math.max(0, Math.min(100, Math.round((document.ragflow_progress || 0) * 100)));
   const active = ["uploaded", "parsing"].includes(document.status);
+  const errorSummary = summarizeError(document.error_message || undefined);
   return (
     <div className="documentRow">
       <FileText size={15} />
@@ -1112,7 +1110,12 @@ function DocumentRow({ document, busy, onDelete }: { document: DocumentItem; bus
         <span>{safeDisplayText(document.project, "未归属项目")}，{statusLabels[document.status] || document.status}{document.chunk_count ? `，${document.chunk_count} 个分块` : ""}</span>
         {active && <div className="progressTrack" aria-label={`解析进度 ${progress}%`}><i style={{ width: `${progress}%` }} /></div>}
         {document.status_message && <small>{safeDisplayText(document.status_message, "RAGFlow 状态不可读，请刷新。")}</small>}
-        {document.error_message && <small className="errorText">{safeDisplayText(document.error_message, "解析失败，错误信息不可读。")}</small>}
+        {document.error_message && (
+          <details className="errorDetails">
+            <summary>{errorSummary}</summary>
+            <pre>{document.error_message}</pre>
+          </details>
+        )}
       </div>
       <button type="button" onClick={() => onDelete(document.id)} disabled={busy} aria-label={`删除 ${safeDisplayText(document.title, "未命名文档")}`}><Trash2 size={15} /></button>
     </div>

@@ -437,6 +437,7 @@ def create_collection(
                 payload.description,
                 parser_config=payload.metadata.get("parser_config") if payload.metadata else None,
             )
+            dataset = rag_client.ensure_dataset_embedding(str(dataset.get("id")))
             metadata["ragflow_dataset_id"] = dataset.get("id")
             metadata["ragflow_dataset_name"] = dataset.get("name")
             _try_create_ragflow_chat(
@@ -1288,6 +1289,23 @@ def run_evaluation_dataset(
         .where(EvaluationCase.dataset_id == dataset.id)
         .order_by(EvaluationCase.created_at.asc())
     ).all()
+    if not cases:
+        run.status = "skipped"
+        run.completed_at = datetime.utcnow()
+        run.metrics = {
+            "case_count": 0,
+            "recall_at_k": 0.0,
+            "mrr": 0.0,
+            "ndcg_at_k": 0.0,
+            "faithfulness": 0.0,
+            "citation_readability": 0.0,
+            "failure_count": 0,
+            "message": "测评集暂无用例，请先从低证据问题或人工标注中加入用例。",
+        }
+        write_audit(db, current_user, "evaluation_run.skip", "evaluation_dataset", dataset_id, run.metrics)
+        db.commit()
+        db.refresh(run)
+        return _evaluation_run_out(db, run)
     totals = {"recall": 0.0, "mrr": 0.0, "ndcg": 0.0, "citation_readability": 0.0}
     failures: list[dict] = []
     for case in cases:
@@ -1825,7 +1843,7 @@ def _ensure_ragflow_dataset(db: Session, collection: Collection) -> str:
     dataset_id = metadata.get("ragflow_dataset_id")
     if dataset_id:
         try:
-            RagFlowClient().get_dataset(str(dataset_id))
+            RagFlowClient().ensure_dataset_embedding(str(dataset_id))
             return str(dataset_id)
         except RagFlowError:
             pass
@@ -1834,6 +1852,7 @@ def _ensure_ragflow_dataset(db: Session, collection: Collection) -> str:
         description=collection.description,
         parser_config=metadata.get("parser_config"),
     )
+    dataset = RagFlowClient().ensure_dataset_embedding(str(dataset.get("id")))
     metadata["ragflow_dataset_id"] = dataset.get("id")
     metadata["ragflow_dataset_name"] = dataset.get("name")
     collection.metadata_ = metadata

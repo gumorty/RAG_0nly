@@ -120,6 +120,11 @@ def extract_document_signals(text: str) -> dict:
     }
 
 
+def extract_lab_report_signals(text: str) -> dict:
+    """Backward-compatible name for document signal extraction."""
+    return extract_document_signals(text)
+
+
 def _looks_like_report(text: str) -> bool:
     hint_count = sum(1 for hint in REPORT_HINTS if hint.lower() in text.lower())
     date_like = bool(re.search(r"20\d{2}[-/年]\d{1,2}[-/月]\d{1,2}", text))

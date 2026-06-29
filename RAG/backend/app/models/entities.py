@@ -132,6 +132,45 @@ class Chunk(Base):
     document: Mapped[Document] = relationship(back_populates="chunks")
 
 
+class RetrievalChunkCache(Base):
+    __tablename__ = "retrieval_chunk_cache"
+    __table_args__ = (
+        UniqueConstraint("collection_id", "ragflow_chunk_id", name="uq_retrieval_chunk_cache_remote"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    collection_id: Mapped[str] = mapped_column(ForeignKey("collections.id"), index=True)
+    document_id: Mapped[str | None] = mapped_column(ForeignKey("documents.id"), index=True)
+    ragflow_dataset_id: Mapped[str | None] = mapped_column(String(200), index=True)
+    ragflow_document_id: Mapped[str | None] = mapped_column(String(200), index=True)
+    ragflow_chunk_id: Mapped[str] = mapped_column(String(200), index=True)
+    title: Mapped[str | None] = mapped_column(String(500))
+    title_path: Mapped[list[str]] = mapped_column(JSON, default=list)
+    page_no: Mapped[str | None] = mapped_column(String(80), index=True)
+    content: Mapped[str] = mapped_column(Text)
+    normalized_content: Mapped[str] = mapped_column(Text)
+    token_count: Mapped[int] = mapped_column(Integer, default=0)
+    content_hash: Mapped[str] = mapped_column(String(64), index=True)
+    score_metadata: Mapped[dict] = mapped_column(JSON, default=dict)
+    metadata_: Mapped[dict] = mapped_column("metadata", JSON, default=dict)
+    available: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class DomainLexiconTerm(Base):
+    __tablename__ = "domain_lexicon_terms"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    collection_id: Mapped[str | None] = mapped_column(ForeignKey("collections.id"), index=True)
+    term: Mapped[str] = mapped_column(String(200), index=True)
+    term_type: Mapped[str] = mapped_column(String(40), index=True)
+    expansion: Mapped[str | None] = mapped_column(Text)
+    weight: Mapped[float] = mapped_column(Float, default=1.0)
+    metadata_: Mapped[dict] = mapped_column("metadata", JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
 class RetrievalTrace(Base):
     __tablename__ = "retrieval_traces"
 
@@ -180,6 +219,8 @@ class Answer(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     trace_id: Mapped[str] = mapped_column(ForeignKey("retrieval_traces.id"), index=True)
     collection_id: Mapped[str] = mapped_column(String(36), index=True)
+    user_id: Mapped[str | None] = mapped_column(String(36), index=True)
+    session_id: Mapped[str | None] = mapped_column(String(80), index=True)
     question: Mapped[str] = mapped_column(Text)
     answer: Mapped[str] = mapped_column(Text)
     citations: Mapped[list[dict]] = mapped_column(JSON, default=list)
@@ -198,6 +239,63 @@ class EvalCase(Base):
     expected_answer: Mapped[str | None] = mapped_column(Text)
     expected_chunk_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
     metadata_: Mapped[dict] = mapped_column("metadata", JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class EvaluationDataset(Base):
+    __tablename__ = "evaluation_datasets"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    collection_id: Mapped[str] = mapped_column(ForeignKey("collections.id"), index=True)
+    name: Mapped[str] = mapped_column(String(200), index=True)
+    description: Mapped[str | None] = mapped_column(Text)
+    metadata_: Mapped[dict] = mapped_column("metadata", JSON, default=dict)
+    created_by: Mapped[str | None] = mapped_column(String(36), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class EvaluationCase(Base):
+    __tablename__ = "evaluation_cases"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    dataset_id: Mapped[str] = mapped_column(ForeignKey("evaluation_datasets.id"), index=True)
+    collection_id: Mapped[str] = mapped_column(ForeignKey("collections.id"), index=True)
+    question: Mapped[str] = mapped_column(Text)
+    expected_answer: Mapped[str | None] = mapped_column(Text)
+    expected_chunk_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    tags: Mapped[list[str]] = mapped_column(JSON, default=list)
+    metadata_: Mapped[dict] = mapped_column("metadata", JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class EvaluationRun(Base):
+    __tablename__ = "evaluation_runs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    dataset_id: Mapped[str] = mapped_column(ForeignKey("evaluation_datasets.id"), index=True)
+    collection_id: Mapped[str] = mapped_column(ForeignKey("collections.id"), index=True)
+    strategy: Mapped[dict] = mapped_column(JSON, default=dict)
+    status: Mapped[str] = mapped_column(String(40), default="pending", index=True)
+    metrics: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_by: Mapped[str | None] = mapped_column(String(36), index=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+
+class EvaluationResult(Base):
+    __tablename__ = "evaluation_results"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    run_id: Mapped[str] = mapped_column(ForeignKey("evaluation_runs.id"), index=True)
+    case_id: Mapped[str] = mapped_column(ForeignKey("evaluation_cases.id"), index=True)
+    question: Mapped[str] = mapped_column(Text)
+    answer: Mapped[str | None] = mapped_column(Text)
+    retrieved_chunk_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    expected_chunk_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    metrics: Mapped[dict] = mapped_column(JSON, default=dict)
+    citations: Mapped[list[dict]] = mapped_column(JSON, default=list)
+    passed: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    error_message: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 

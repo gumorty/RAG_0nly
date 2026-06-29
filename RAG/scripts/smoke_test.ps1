@@ -1,6 +1,6 @@
 $ErrorActionPreference = "Stop"
 
-$apiBase = if ($env:API_BASE) { $env:API_BASE } else { "http://localhost:8000" }
+$apiBase = if ($env:API_BASE) { $env:API_BASE } else { "http://localhost:18010" }
 $apiKey = if ($env:API_KEY) { $env:API_KEY } else { "smoke-admin-key-change-me" }
 $headers = @{ "X-API-Key" = $apiKey }
 

@@ -34,11 +34,14 @@ import { api, auth } from "./api";
 import type {
   AdminMetrics,
   ChatResponse,
+  ChatSession,
   ChatTurn,
   Citation,
   Collection,
   CollectionQuality,
   DocumentItem,
+  EvaluationDataset,
+  EvaluationRun,
   ImportBatch,
   KnowledgeGap,
   MeetingSummary,
@@ -128,7 +131,13 @@ export default function HomePage() {
   const [batches, setBatches] = useState<ImportBatch[]>([]);
   const [quality, setQuality] = useState<CollectionQuality | null>(null);
   const [summary, setSummary] = useState<MeetingSummary | null>(null);
+  const [evaluationDatasets, setEvaluationDatasets] = useState<EvaluationDataset[]>([]);
+  const [activeEvaluationDatasetId, setActiveEvaluationDatasetId] = useState("");
+  const [evaluationRun, setEvaluationRun] = useState<EvaluationRun | null>(null);
+  const [evaluationBusy, setEvaluationBusy] = useState(false);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [sessions, setSessions] = useState<ChatSession[]>([]);
+  const [activeSessionId, setActiveSessionId] = useState("");
   const [name, setName] = useState("企业知识库");
   const [description, setDescription] = useState("项目资料、会议纪要、周报、制度文档和网页资料");
   const [uploadMeta, setUploadMeta] = useState({ author: "", project: "", meeting_date: "", tags: "" });
@@ -183,10 +192,9 @@ export default function HomePage() {
   useEffect(() => {
     if (!user) return;
     setMessages([]);
-    Promise.all([
-      loadWorkspace(),
-      loadConversation(selectedId)
-    ]).catch((err) => setError(err instanceof Error ? err.message : "加载知识库详情失败"));
+    setSessions([]);
+    setActiveSessionId("");
+    loadSelectedCollection(selectedId).catch((err) => setError(err instanceof Error ? err.message : "加载知识库详情失败"));
   }, [selectedId, user]);
 
   useEffect(() => {
@@ -223,26 +231,49 @@ export default function HomePage() {
       setBatches([]);
       setQuality(null);
       setSummary(null);
+      setEvaluationDatasets([]);
+      setActiveEvaluationDatasetId("");
+      setEvaluationRun(null);
       return;
     }
-    const [nextDocuments, nextQuality, nextSummary, nextBatches] = await Promise.all([
+    const [nextDocuments, nextQuality, nextSummary, nextBatches, nextEvaluationDatasets] = await Promise.all([
       api.listDocuments(collectionId),
       api.collectionQuality(collectionId).catch(() => null),
       api.meetingSummary(collectionId).catch(() => null),
-      api.listImportBatches(collectionId).catch(() => [])
+      api.listImportBatches(collectionId).catch(() => []),
+      api.listEvaluationDatasets(collectionId).then((res) => res.items).catch(() => [])
     ]);
     setDocuments(nextDocuments);
     setQuality(nextQuality);
     setSummary(nextSummary);
     setBatches(nextBatches);
+    setEvaluationDatasets(nextEvaluationDatasets);
+    setActiveEvaluationDatasetId((current) => current && nextEvaluationDatasets.some((item) => item.id === current)
+      ? current
+      : nextEvaluationDatasets[0]?.id || "");
   }
 
-  async function loadConversation(collectionId = selectedId) {
+  async function loadSelectedCollection(collectionId = selectedId) {
     if (!collectionId) {
+      setMessages([]);
+      setSessions([]);
+      setActiveSessionId("");
+      return;
+    }
+    await loadWorkspace(collectionId);
+    const nextSessions = await api.listChatSessions(collectionId).catch(() => []);
+    const active = nextSessions[0] || await api.createChatSession(collectionId, "新对话");
+    setSessions(nextSessions.length ? nextSessions : [active]);
+    setActiveSessionId(active.session_id);
+    await loadConversation(collectionId, active.session_id);
+  }
+
+  async function loadConversation(collectionId = selectedId, sessionId = activeSessionId) {
+    if (!collectionId || !sessionId) {
       setMessages([]);
       return;
     }
-    const answers = await api.listAnswers(collectionId, 20).catch(() => []);
+    const answers = await api.listAnswers(collectionId, 1000, sessionId).catch(() => []);
     const restored: ChatMessage[] = [];
     for (const answer of answers) {
       restored.push({ id: `${answer.id}-question`, role: "user", content: answer.question });
@@ -287,6 +318,60 @@ export default function HomePage() {
       await loadCollections();
       setSelectedId(created.id);
     }, "创建知识库失败");
+  }
+
+  async function deleteCurrentCollection() {
+    if (!selectedId || !selectedCollection) return;
+    const ok = window.confirm(`确认删除知识库「${selectedCollection.name}」？这会删除本地文档、会话、问答记录，并同步删除 RAGFlow dataset。`);
+    if (!ok) return;
+    await runAction(async () => {
+      await api.deleteCollection(selectedId);
+      setMessages([]);
+      setSessions([]);
+      setActiveSessionId("");
+      setSelectedId("");
+      await loadCollections();
+      setNotice("知识库已删除，关联会话、问答记录和索引已清理。");
+    }, "删除知识库失败");
+  }
+
+  async function createNewSession() {
+    if (!selectedId) return;
+    await runAction(async () => {
+      const session = await api.createChatSession(selectedId, "新对话");
+      const nextSessions = [session, ...sessions.filter((item) => item.session_id !== session.session_id)];
+      setSessions(nextSessions);
+      setActiveSessionId(session.session_id);
+      setMessages([]);
+    }, "新建对话失败");
+  }
+
+  async function switchSession(sessionId: string) {
+    if (!selectedId || sessionId === activeSessionId) return;
+    setActiveSessionId(sessionId);
+    setMessages([]);
+    await loadConversation(selectedId, sessionId);
+  }
+
+  async function deleteCurrentSession() {
+    if (!selectedId || !activeSessionId) return;
+    const ok = window.confirm("确认删除当前对话？该对话中的问答历史和检索 trace 会从数据库中删除。");
+    if (!ok) return;
+    await runAction(async () => {
+      await api.deleteChatSession(selectedId, activeSessionId);
+      const remaining = sessions.filter((item) => item.session_id !== activeSessionId);
+      if (remaining.length > 0) {
+        setSessions(remaining);
+        setActiveSessionId(remaining[0].session_id);
+        await loadConversation(selectedId, remaining[0].session_id);
+      } else {
+        const session = await api.createChatSession(selectedId, "新对话");
+        setSessions([session]);
+        setActiveSessionId(session.session_id);
+        setMessages([]);
+      }
+      setNotice("当前对话已删除，记忆和检索 trace 已清理。");
+    }, "删除对话失败");
   }
 
   async function upload(event: FormEvent) {
@@ -334,6 +419,13 @@ export default function HomePage() {
     event?.preventDefault();
     const text = (preset || question).trim();
     if (!selectedId || !text) return;
+    let sessionId = activeSessionId;
+    if (!sessionId) {
+      const session = await api.createChatSession(selectedId, "新对话");
+      sessionId = session.session_id;
+      setActiveSessionId(sessionId);
+      setSessions((items) => [session, ...items.filter((item) => item.session_id !== session.session_id)]);
+    }
     const history = toChatHistory(messages);
     const userMessage: ChatMessage = { id: crypto.randomUUID(), role: "user", content: text };
     const assistantId = crypto.randomUUID();
@@ -344,16 +436,17 @@ export default function HomePage() {
 
     try {
       const controller = api.chatStream(
-        { collection_id: selectedId, question: text, history },
+        { collection_id: selectedId, question: text, session_id: sessionId, history },
         (event) => {
           if (event.answer) {
+            const answerText = event.answer;
             setMessages((items) => {
               const updated = [...items];
               const last = updated[updated.length - 1];
               if (last && last.role === "assistant") {
-                last.content = mergeAssistantContent(last.content, event.answer);
+                last.content = mergeAssistantContent(last.content, answerText);
               } else {
-                updated.push({ id: assistantId, role: "assistant", content: event.answer });
+                updated.push({ id: assistantId, role: "assistant", content: answerText });
               }
               return updated;
             });
@@ -402,7 +495,7 @@ export default function HomePage() {
     } catch {
       // fallback to non-streaming
       try {
-        const response = await api.chat({ collection_id: selectedId, question: text, history });
+        const response = await api.chat({ collection_id: selectedId, question: text, session_id: sessionId, history });
         setMessages((items) => [...items, toAssistantMessage(response)]);
         await refreshAfterChat();
       } catch (err) {
@@ -417,6 +510,7 @@ export default function HomePage() {
     await Promise.all([
       loadCollections(),
       loadWorkspace(),
+      selectedId && activeSessionId ? loadConversation(selectedId, activeSessionId) : Promise.resolve(),
       api.knowledgeGaps(selectedId).then((items) => {
         setGaps((all) => [...all.filter((gap) => gap.collection_id !== selectedId), ...items]);
       }).catch(() => undefined)
@@ -455,6 +549,58 @@ export default function HomePage() {
       await api.answerToEvalCase(answerId);
       setGaps(await api.knowledgeGaps(selectedId));
     }, "加入评估集失败");
+  }
+
+  async function createDefaultEvaluationDataset() {
+    if (!selectedId) return;
+    await runAction(async () => {
+      const dataset = await api.createEvaluationDataset({
+        collection_id: selectedId,
+        name: `${selectedCollectionName} 测评集`,
+        description: "用于检验召回、排序、引用可读率和低证据失败样例。"
+      });
+      setEvaluationDatasets((items) => [dataset, ...items.filter((item) => item.id !== dataset.id)]);
+      setActiveEvaluationDatasetId(dataset.id);
+      setEvaluationRun(null);
+      setNotice("测评集已创建，可以继续从低证据问题沉淀用例。");
+    }, "创建测评集失败");
+  }
+
+  async function addGapToEvaluation(gap: KnowledgeGap) {
+    const datasetId = activeEvaluationDatasetId || evaluationDatasets[0]?.id;
+    if (!datasetId) {
+      setError("请先创建测评集。");
+      return;
+    }
+    await runAction(async () => {
+      await api.createEvaluationCase(datasetId, {
+        question: gap.question,
+        expected_chunk_ids: gap.citations?.map((citation) => citation.chunk_id).filter(Boolean) || [],
+        metadata: { source: "knowledge_gap", answer_id: gap.id, reason: gap.reason }
+      });
+      const next = await api.listEvaluationDatasets(selectedId);
+      setEvaluationDatasets(next.items);
+      setNotice("失败样例已加入测评集。");
+    }, "加入测评集失败");
+  }
+
+  async function runEvaluationCenter() {
+    const datasetId = activeEvaluationDatasetId || evaluationDatasets[0]?.id;
+    if (!datasetId) {
+      setError("请先创建或选择一个测评集。");
+      return;
+    }
+    setEvaluationBusy(true);
+    setError("");
+    try {
+      const run = await api.runEvaluation(datasetId, { strategy: { retriever: "local_bm25_cache", top_k: 10 } });
+      setEvaluationRun(run);
+      setNotice("测评运行完成。");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "测评运行失败");
+    } finally {
+      setEvaluationBusy(false);
+    }
   }
 
   async function deleteDocument(documentId: string) {
@@ -520,7 +666,7 @@ export default function HomePage() {
 
         <div className="userPanel">
           <UserRound size={16} />
-          <div><strong>{user.name}</strong><span>{user.email} · {user.role}</span></div>
+          <div><strong>{user.name}</strong><span>{user.username || user.email} · {user.role}</span></div>
           <button type="button" onClick={logout} aria-label="退出登录"><LogOut size={15} /></button>
         </div>
 
@@ -580,12 +726,31 @@ export default function HomePage() {
           <div className="headerActions">
             <StatusPill icon={<ShieldCheck size={14} />} label={`可检索率 ${readyRatio}%`} />
             <StatusPill icon={<Layers3 size={14} />} label={`${quality?.total_chunks ?? 0} 个分块`} />
+            <button className="iconButton" onClick={createNewSession} disabled={busy || !selectedId} type="button" aria-label="新建对话"><MessageSquareText size={18} /></button>
+            <button className="iconButton danger" onClick={deleteCurrentSession} disabled={busy || !activeSessionId} type="button" aria-label="删除当前对话"><Trash2 size={18} /></button>
+            <button className="iconButton danger" onClick={deleteCurrentCollection} disabled={busy || !selectedId} type="button" aria-label="删除当前知识库"><Database size={18} /></button>
             <button className="iconButton" onClick={refreshAll} disabled={busy} type="button" aria-label="刷新数据"><RefreshCw size={18} /></button>
           </div>
         </header>
 
         {error && <div className="errorBanner" role="alert">{error}</div>}
         {notice && <div className="noticeBanner" role="status"><ShieldCheck size={16} /><span>{notice}</span><button type="button" onClick={() => setNotice("")}>知道了</button></div>}
+
+        <div className="sessionBar" aria-label="对话列表">
+          {sessions.map((session) => (
+            <button
+              key={session.session_id}
+              className={session.session_id === activeSessionId ? "sessionTab active" : "sessionTab"}
+              type="button"
+              disabled={busy}
+              onClick={() => switchSession(session.session_id)}
+            >
+              <span>{safeDisplayText(session.title || `对话 ${session.session_id.slice(0, 6)}`, "新对话")}</span>
+              <small>{session.turn_count} 轮</small>
+            </button>
+          ))}
+          {sessions.length === 0 && <span className="emptyHint">暂无对话。</span>}
+        </div>
 
         <div className="chatStream" aria-live="polite">
           {messages.length === 0 && (
@@ -664,6 +829,54 @@ export default function HomePage() {
         </section>
 
         <section className="inspectorPanel">
+          <PanelTitle icon={<BrainCircuit size={18} />} title="测评中心" meta="召回、排序、引用质量回归" />
+          <div className="evalToolbar">
+            <select
+              value={activeEvaluationDatasetId}
+              onChange={(event) => setActiveEvaluationDatasetId(event.target.value)}
+              disabled={!evaluationDatasets.length || evaluationBusy}
+            >
+              {evaluationDatasets.length === 0 && <option value="">暂无测评集</option>}
+              {evaluationDatasets.map((dataset) => (
+                <option key={dataset.id} value={dataset.id}>{dataset.name} · {dataset.case_count} 例</option>
+              ))}
+            </select>
+            <button type="button" onClick={createDefaultEvaluationDataset} disabled={!selectedId || evaluationBusy}>创建</button>
+            <button type="button" onClick={runEvaluationCenter} disabled={!activeEvaluationDatasetId || evaluationBusy}>
+              {evaluationBusy ? "运行中..." : "运行"}
+            </button>
+          </div>
+          {evaluationRun ? (
+            <>
+              {evaluationRun.metrics.message && <div className="emptyHint">{String(evaluationRun.metrics.message)}</div>}
+              <div className="qualityGrid">
+                <Metric label="Recall" value={formatMetric(evaluationRun.metrics.recall_at_k)} />
+                <Metric label="MRR" value={formatMetric(evaluationRun.metrics.mrr)} />
+                <Metric label="NDCG" value={formatMetric(evaluationRun.metrics.ndcg_at_k)} />
+                <Metric label="引用可读" value={formatMetric(evaluationRun.metrics.citation_readability)} />
+              </div>
+              <div className="evalFailureList">
+                {evaluationRun.results.filter((item) => !item.passed).slice(0, 4).map((item) => (
+                  <article className="gapItem" key={item.id}>
+                    <div><strong>失败样例</strong><span>{formatMetric(item.metrics?.recall_at_k)}</span></div>
+                    <p>{safeDisplayText(item.question, "问题文本不可读")}</p>
+                    {item.error_message && <small className="errorText">{summarizeError(item.error_message)}</small>}
+                  </article>
+                ))}
+                {evaluationRun.results.length > 0 && evaluationRun.results.every((item) => item.passed) && <div className="emptyHint">本轮测评未发现失败样例。</div>}
+              </div>
+            </>
+          ) : (
+            <div className="emptyHint">选择测评集后运行，查看 recall/MRR/NDCG/faithfulness/引用可读率。</div>
+          )}
+          {selectedGaps.length > 0 && (
+            <button className="textButton" type="button" onClick={() => addGapToEvaluation(selectedGaps[0])} disabled={!activeEvaluationDatasetId || evaluationBusy}>
+              将最新低证据问题加入测评集
+            </button>
+          )}
+        </section>
+
+        <section className="inspectorPanel">
           <PanelTitle icon={<PanelRightOpen size={18} />} title="资料摘要" meta={summary ? `${summary.document_count} 份可分析资料，全部来自文档抽取信号` : "等待文档分析"} />
           {!summary && <div className="emptyHint">暂无摘要。</div>}
           {summary && <>
@@ -681,7 +894,7 @@ export default function HomePage() {
 
 function AuthPage({ onAuthenticated }: { onAuthenticated: (user: User) => Promise<void> }) {
   const [mode, setMode] = useState<"login" | "register">("login");
-  const [email, setEmail] = useState("");
+  const [username, setUsername] = useState("");
   const [name, setName] = useState("RAG Admin");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
@@ -693,8 +906,8 @@ function AuthPage({ onAuthenticated }: { onAuthenticated: (user: User) => Promis
     setError("");
     try {
       const result = mode === "login"
-        ? await auth.login({ email, password })
-        : await auth.register({ email, name, password });
+        ? await auth.login({ username, password })
+        : await auth.register({ username, name, password });
       await onAuthenticated(result.user);
     } catch (err) {
       setError(err instanceof Error ? err.message : "认证失败");
@@ -707,10 +920,10 @@ function AuthPage({ onAuthenticated }: { onAuthenticated: (user: User) => Promis
     <main className="authShell">
       <section className="authCard">
         <div className="authLogo"><img src="/rag.png" alt="RAG 知识中枢 Logo" /><div><strong>RAG 知识中枢</strong><span>RAGFlow 驱动的企业知识库</span></div></div>
-        <div><h1>{mode === "login" ? "登录系统" : "注册账号"}</h1><p>使用双 token 会话保护知识库、模型配置和导入数据。</p></div>
+        <div><h1>{mode === "login" ? "登录系统" : "注册账号"}</h1><p>使用用户名和密码登录，双 token 会话保护知识库和导入数据。</p></div>
         <form className="authForm" onSubmit={submit}>
           {mode === "register" && <label><span>姓名</span><input value={name} onChange={(event) => setName(event.target.value)} required /></label>}
-          <label><span>邮箱</span><input type="email" value={email} onChange={(event) => setEmail(event.target.value)} placeholder="admin@example.com" required /></label>
+          <label><span>用户名</span><input value={username} onChange={(event) => setUsername(event.target.value)} placeholder="admin" autoComplete="username" required /></label>
           <label><span>密码</span><input type="password" value={password} onChange={(event) => setPassword(event.target.value)} placeholder="请输入登录密码" required /></label>
           <p className="authHint">密码至少 10 位，包含大小写字母、数字和特殊字符。</p>
           {error && <div className="errorBanner">{error}</div>}
@@ -743,6 +956,26 @@ function safeDisplayText(value: string | null | undefined, fallback: string) {
   if (!text) return fallback;
   if (/\?{2,}/.test(text)) return fallback;
   return text;
+}
+
+function formatMetric(value: unknown) {
+  if (typeof value !== "number" || Number.isNaN(value)) return "0.000";
+  return value.toFixed(3);
+}
+
+function summarizeError(value: string | null | undefined) {
+  const text = (value || "").replace(/\s+/g, " ").trim();
+  if (!text) return "处理失败，未返回可读错误信息。";
+  if (text.includes("AllocationQuota.FreeTierOnly") || text.includes("free quota has been exhausted")) {
+    return "Embedding 模型额度不足或免费额度已耗尽，请切换到可用的 Embedding 模型后重新解析。";
+  }
+  if (text.includes("Fail to bind embedding model")) {
+    return "RAGFlow 无法绑定当前 Embedding 模型，请检查知识库的 Embedding 配置后重新解析。";
+  }
+  if (text.includes("doesn't own") || text.includes("not visible in the target dataset")) {
+    return "RAGFlow 文档与当前知识库不匹配，请删除该文档后重新上传。";
+  }
+  return text.length > 220 ? `${text.slice(0, 220)}...` : text;
 }
 
 function mergeAssistantContent(current: string, incoming: string) {
@@ -823,7 +1056,7 @@ function StatusPill({ icon, label }: { icon: React.ReactNode; label: string }) {
   return <span className="statusPill">{icon}{label}</span>;
 }
 
-function Metric({ label, value, tone }: { label: string; value: number; tone?: "warn" }) {
+function Metric({ label, value, tone }: { label: string; value: number | string; tone?: "warn" }) {
   return <div className={`miniMetric ${tone || ""}`}><span>{label}</span><strong>{value}</strong></div>;
 }
 
@@ -868,6 +1101,7 @@ function CitationCard({ citation, index }: { citation: Citation; index: number }
 function DocumentRow({ document, busy, onDelete }: { document: DocumentItem; busy: boolean; onDelete: (id: string) => void }) {
   const progress = Math.max(0, Math.min(100, Math.round((document.ragflow_progress || 0) * 100)));
   const active = ["uploaded", "parsing"].includes(document.status);
+  const errorSummary = summarizeError(document.error_message || undefined);
   return (
     <div className="documentRow">
       <FileText size={15} />
@@ -876,7 +1110,12 @@ function DocumentRow({ document, busy, onDelete }: { document: DocumentItem; bus
         <span>{safeDisplayText(document.project, "未归属项目")}，{statusLabels[document.status] || document.status}{document.chunk_count ? `，${document.chunk_count} 个分块` : ""}</span>
         {active && <div className="progressTrack" aria-label={`解析进度 ${progress}%`}><i style={{ width: `${progress}%` }} /></div>}
         {document.status_message && <small>{safeDisplayText(document.status_message, "RAGFlow 状态不可读，请刷新。")}</small>}
-        {document.error_message && <small className="errorText">{safeDisplayText(document.error_message, "解析失败，错误信息不可读。")}</small>}
+        {document.error_message && (
+          <details className="errorDetails">
+            <summary>{errorSummary}</summary>
+            <pre>{document.error_message}</pre>
+          </details>
+        )}
       </div>
       <button type="button" onClick={() => onDelete(document.id)} disabled={busy} aria-label={`删除 ${safeDisplayText(document.title, "未命名文档")}`}><Trash2 size={15} /></button>
     </div>

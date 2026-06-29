@@ -5,6 +5,15 @@ export type Collection = {
   metadata: Record<string, unknown>;
 };
 
+export type ChatSession = {
+  session_id: string;
+  collection_id: string;
+  title?: string | null;
+  turn_count: number;
+  created_at: string;
+  updated_at: string;
+};
+
 export type DocumentItem = {
   id: string;
   collection_id: string;
@@ -20,6 +29,9 @@ export type DocumentItem = {
   ragflow_progress?: number | null;
   chunk_count?: number | null;
   token_count?: number | null;
+  parser_engine?: string | null;
+  parse_quality_score?: number | null;
+  parse_quality_warnings?: string[];
 };
 
 export type ImportBatch = {
@@ -76,6 +88,7 @@ export type Citation = {
 export type ChatResponse = {
   answer_id: string;
   trace_id: string;
+  session_id?: string | null;
   answer: string;
   citations: Citation[];
   evidence_score: number;
@@ -86,6 +99,8 @@ export type AnswerItem = {
   id: string;
   trace_id: string;
   collection_id: string;
+  user_id?: string | null;
+  session_id?: string | null;
   question: string;
   answer: string;
   citations: Citation[];
@@ -100,11 +115,19 @@ export type ChatTurn = {
   content: string;
 };
 
+export type ChatPayload = {
+  collection_id: string;
+  question: string;
+  session_id?: string;
+  history?: ChatTurn[];
+};
+
 export type StreamEvent = {
-  answer: string;
+  answer?: string;
   reference?: { chunks?: Citation[]; doc_aggs?: Array<Record<string, unknown>> };
   final: boolean;
   error?: string;
+  warning?: string;
 };
 
 export type CollectionQuality = {
@@ -116,6 +139,8 @@ export type CollectionQuality = {
   avg_chunks_per_ready_document: number;
   warning_counts: Record<string, number>;
   top_terms: [string, number][];
+  avg_parse_quality_score: number;
+  parser_engine_counts: Record<string, number>;
 };
 
 export type MeetingSummary = {
@@ -137,6 +162,40 @@ export type StrategyCompareResult = {
   winner?: Record<string, unknown> | null;
 };
 
+export type EvaluationDataset = {
+  id: string;
+  collection_id: string;
+  name: string;
+  description?: string | null;
+  case_count: number;
+  metadata: Record<string, unknown>;
+  created_at?: string | null;
+};
+
+export type EvaluationResult = {
+  id: string;
+  case_id: string;
+  question: string;
+  retrieved_chunk_ids: string[];
+  expected_chunk_ids: string[];
+  metrics: Record<string, number | boolean | string | null>;
+  citations: Citation[];
+  passed: boolean;
+  error_message?: string | null;
+};
+
+export type EvaluationRun = {
+  id: string;
+  dataset_id: string;
+  collection_id: string;
+  strategy: Record<string, unknown>;
+  status: string;
+  metrics: Record<string, number | string | unknown[]>;
+  started_at?: string | null;
+  completed_at?: string | null;
+  results: EvaluationResult[];
+};
+
 export type ModelConfig = {
   id: string;
   name: string;
@@ -151,6 +210,7 @@ export type ModelConfig = {
 
 export type User = {
   id: string;
+  username: string;
   email: string;
   name: string;
   role: string;

@@ -1,63 +1,96 @@
 # Enterprise RAG Knowledge Base
 
-面向实验室和企业私有资料的 RAG 知识库管理系统。当前版本采用 Python/FastAPI 后端、Next.js 前端、PostgreSQL、Redis、Qdrant 和 MinIO，通过 Docker Compose 一键启动。
+这是一个面向企业资料、项目文档、会议纪要、制度文件和网页资料的 RAG 知识库管理系统。当前主链路是“管理平台 + RAGFlow 引擎”：
 
-## Architecture
+- 管理平台负责账号、权限、知识库、文档状态、会话、模型路由、审计和前端交互。
+- RAGFlow 负责 DeepDoc 解析、chunk、Embedding、索引和混合检索。
+- 最终回答由管理平台基于 RAGFlow 返回的证据调用当前启用的 Chat 模型生成。
 
-- Backend: Python + FastAPI + SQLAlchemy + Celery
-- Frontend: Next.js chat-first knowledge-base workspace
+## 架构
+
+```text
+Browser
+-> Frontend / Next.js
+-> Management API / FastAPI
+-> RAGFlow API
+-> DeepDoc or optional parser / Embedding / Elasticsearch
+-> Chat model
+-> Answer with citations and retrieval trace
+```
+
+核心组件：
+
+- Frontend: Next.js
+- Backend: Python + FastAPI + SQLAlchemy
 - Auth: JWT access token + refresh token
-- Database: PostgreSQL
-- Queue/cache: Redis
-- Vector store: Qdrant
-- Object storage: MinIO
-- Retrieval: dense/hash embedding + sparse keyword hybrid scoring
-- Deployment: Docker Compose
+- Management DB: PostgreSQL
+- Cache: Redis
+- Object Storage: MinIO
+- RAG Engine: RAGFlow
+- RAGFlow Storage: Elasticsearch / MySQL / MinIO / Redis
 
-## Quick Start
+## 快速启动
+
+推荐使用脚本启动两套 compose：
 
 ```powershell
 cd D:\Researching\LLMStart\RAG
-Copy-Item .env.example .env
-docker compose up --build -d
+powershell -ExecutionPolicy Bypass -File scripts\start-all.ps1
 ```
 
-Services:
+查看状态：
 
-- Frontend: http://localhost:3110
-- API: http://localhost:8010/api/health
-- MinIO API: http://localhost:9100
-- MinIO Console: http://localhost:9101
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\status-all.ps1
+```
 
-Default login:
+停止服务：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\stop-all.ps1
+```
+
+## 访问地址
+
+- 管理系统前端: http://localhost:14070
+- 管理系统 API: http://localhost:8010/api/health
+- 管理系统 MinIO API: http://localhost:19100
+- 管理系统 MinIO Console: http://localhost:19101
+- RAGFlow Web: http://localhost:18080
+- RAGFlow API: http://localhost:19380/api/v1
+
+默认本地管理员：
 
 - Email: `admin@example.com`
 - Password: `Admin@123456`
 
-Change `ADMIN_API_KEY`, `APP_SECRET`, and the bootstrap admin password before deploying outside a trusted local environment.
+生产环境部署前必须替换 `.env` 中的密钥、管理员密码、MinIO 密码、RAGFlow API Key 和模型 API Key。
 
-## Model Routing
+## Docker 说明
 
-The app starts with a mock model so the RAG workflow can run without a third-party key. To use Alibaba Cloud Model Studio / Bailian, open the left-side model routing panel and add:
+Docker Desktop 中会看到两组容器：
 
-- Provider: `openai_compatible`
-- Model: `qwen-plus`
-- Base URL: `https://dashscope.aliyuncs.com/compatible-mode/v1`
-- API Key: your Bailian/DashScope API key
+- `rag-*`: 本管理系统，包括 `frontend`、`api`、`postgres`、`redis`、`minio`。
+- `docker-*`: RAGFlow 官方 compose 栈，包括 `ragflow-gpu`、`mysql`、`es01`、`minio`、`redis`。
 
-After saving and activating the model, `/api/chat` uses the active row in `model_configs`.
+两组容器通过 Docker 网络 `docker_ragflow` 互通。管理平台容器内访问 RAGFlow 使用：
 
-## RAG Processing Chain
+```text
+http://ragflow-gpu:9380/api/v1
+```
 
-1. Ingest local files, URL pages, or ZIP batches.
-2. Deduplicate documents by SHA-256 checksum inside each collection.
-3. Parse supported text-oriented files and normalize extracted content.
-4. Clean encoding, whitespace, line breaks, and noisy text.
-5. Split documents with token-aware hierarchical chunking and overlap windows.
-6. Store chunk text, token count, title path, sparse terms, and document metadata.
-7. Build document quality reports and source-aware summaries.
-8. Extract enterprise signals: progress, risks, next steps, and decisions from actual document content.
-9. Retrieve with hybrid scoring and optional reranking/context expansion.
-10. Answer only from retrieved evidence, return citations, and record low-evidence knowledge gaps.
+旧的 Qdrant + worker 自研 RAG 链路已放入 `legacy-local-rag` profile，不是默认主链路。
 
-See [docs/RAG_SYSTEM_DESIGN.md](docs/RAG_SYSTEM_DESIGN.md).
+## 当前验证
+
+- API health: `{"status":"ok"}`
+- 前端 `http://localhost:14070` 返回 200
+- CORS 已允许 `http://localhost:14070`
+- 后端测试：`20 passed`
+- 前端构建：`npm run build` 通过
+
+更多细节见：
+
+- [Docker 启动与解析检索规划](docs/2026-06-28-Docker启动与解析检索规划.md)
+- [RAGFlow 集成部署说明](docs/RAGFlow集成部署说明.md)
+- [RAGFlow 链路与企业级评估](docs/RAGFlow链路与企业级评估.md)

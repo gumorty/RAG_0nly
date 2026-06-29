@@ -1,4 +1,4 @@
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, Field
 
 
 class CollectionCreate(BaseModel):
@@ -14,15 +14,29 @@ class CollectionOut(BaseModel):
     metadata: dict
 
 
+class ChatSessionCreate(BaseModel):
+    title: str | None = Field(default=None, max_length=500)
+
+
+class ChatSessionOut(BaseModel):
+    session_id: str
+    collection_id: str
+    title: str | None
+    turn_count: int
+    created_at: str
+    updated_at: str
+
+
 class UserCreate(BaseModel):
-    email: EmailStr
-    name: str = Field(min_length=1, max_length=200)
+    username: str = Field(min_length=3, max_length=80, pattern=r"^[A-Za-z0-9_.@-]+$")
+    name: str | None = Field(default=None, max_length=200)
     role: str = Field(pattern="^(admin|maintainer|member|viewer)$")
     api_key: str = Field(min_length=16, max_length=200)
 
 
 class UserOut(BaseModel):
     id: str
+    username: str
     email: str
     name: str
     role: str
@@ -30,13 +44,14 @@ class UserOut(BaseModel):
 
 
 class RegisterIn(BaseModel):
-    email: EmailStr
-    name: str = Field(min_length=1, max_length=200)
+    username: str = Field(min_length=3, max_length=80, pattern=r"^[A-Za-z0-9_.@-]+$")
+    name: str | None = Field(default=None, max_length=200)
     password: str = Field(min_length=10, max_length=128)
 
 
 class LoginIn(BaseModel):
-    email: EmailStr
+    username: str | None = Field(default=None, min_length=1, max_length=80)
+    email: str | None = Field(default=None, min_length=1, max_length=120)
     password: str = Field(min_length=1, max_length=128)
 
 
@@ -67,6 +82,9 @@ class DocumentOut(BaseModel):
     ragflow_progress: float | None = None
     chunk_count: int | None = None
     token_count: int | None = None
+    parser_engine: str | None = None
+    parse_quality_score: float | None = None
+    parse_quality_warnings: list[str] = Field(default_factory=list)
 
 
 class ImportBatchOut(BaseModel):
@@ -97,6 +115,8 @@ class CollectionQualityOut(BaseModel):
     avg_chunks_per_ready_document: float
     warning_counts: dict[str, int]
     top_terms: list[tuple[str, int]]
+    avg_parse_quality_score: float = 0.0
+    parser_engine_counts: dict[str, int] = Field(default_factory=dict)
 
 
 class AdminMetricsOut(BaseModel):
@@ -128,6 +148,8 @@ class AnswerOut(BaseModel):
     id: str
     trace_id: str
     collection_id: str
+    user_id: str | None = None
+    session_id: str | None = None
     question: str
     answer: str
     citations: list[dict]

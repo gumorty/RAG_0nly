@@ -1,5 +1,4 @@
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8010";
-const API_KEY = process.env.NEXT_PUBLIC_API_KEY || "change-this-admin-api-key";
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:18010";
 const ACCESS_TOKEN_KEY = "rag_access_token";
 const REFRESH_TOKEN_KEY = "rag_refresh_token";
 
@@ -24,17 +23,24 @@ function clearTokens() {
   window.localStorage.removeItem(REFRESH_TOKEN_KEY);
 }
 
+function apiConnectionError(error: unknown) {
+  return new Error(
+    `无法连接后端 API（${API_BASE}）。请确认 Docker 中 api 服务已启动并映射到 18010 端口。${
+      error instanceof Error ? `原始错误：${error.message}` : ""
+    }`
+  );
+}
+
 async function request<T>(path: string, init?: RequestInit, retry = true): Promise<T> {
   const headers = new Headers(init?.headers);
   const token = getAccessToken();
   if (token) headers.set("Authorization", `Bearer ${token}`);
-  headers.set("X-API-Key", API_KEY);
   const response = await fetch(`${API_BASE}/api${path}`, {
     ...init,
     headers,
     cache: "no-store"
   }).catch((error) => {
-    throw new Error(`无法连接后端 API（${API_BASE}）。请确认 Docker 中 api 服务已启动并映射到 8010 端口。${error instanceof Error ? `原始错误：${error.message}` : ""}`);
+    throw apiConnectionError(error);
   });
   if (response.status === 401 && retry && getRefreshToken()) {
     const refreshed = await refreshSession().catch(() => null);
@@ -50,11 +56,11 @@ async function request<T>(path: string, init?: RequestInit, retry = true): Promi
 async function authRequest<T>(path: string, payload: Record<string, unknown>): Promise<T> {
   const response = await fetch(`${API_BASE}/api${path}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", "X-API-Key": API_KEY },
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
     cache: "no-store"
   }).catch((error) => {
-    throw new Error(`无法连接后端 API（${API_BASE}）。请确认 Docker 中 api 服务已启动并映射到 8010 端口。${error instanceof Error ? `原始错误：${error.message}` : ""}`);
+    throw apiConnectionError(error);
   });
   if (!response.ok) {
     throw new Error(await readError(response));
@@ -83,12 +89,12 @@ async function refreshSession() {
 export const auth = {
   getAccessToken,
   clearTokens,
-  login: async (payload: { email: string; password: string }) => {
+  login: async (payload: { username: string; password: string }) => {
     const tokens = await authRequest<import("./types").TokenPair>("/auth/login", payload);
     saveTokens(tokens);
     return tokens;
   },
-  register: async (payload: { email: string; name: string; password: string }) => {
+  register: async (payload: { username: string; name?: string; password: string }) => {
     const tokens = await authRequest<import("./types").TokenPair>("/auth/register", payload);
     saveTokens(tokens);
     return tokens;
@@ -125,9 +131,25 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ ...payload, metadata: {} })
     }),
+  deleteCollection: (collectionId: string) =>
+    request<{ status: string; collection_id: string }>(`/collections/${collectionId}`, { method: "DELETE" }),
+  listChatSessions: (collectionId: string) =>
+    request<import("./types").ChatSession[]>(`/collections/${collectionId}/sessions`),
+  createChatSession: (collectionId: string, title?: string) =>
+    request<import("./types").ChatSession>(`/collections/${collectionId}/sessions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title })
+    }),
+  deleteChatSession: (collectionId: string, sessionId: string) =>
+    request<{ status: string; session_id: string }>(`/collections/${collectionId}/sessions/${encodeURIComponent(sessionId)}`, {
+      method: "DELETE"
+    }),
   listDocuments: (collectionId: string) => request<import("./types").DocumentItem[]>(`/collections/${collectionId}/documents`),
-  listAnswers: (collectionId: string, limit = 20) =>
-    request<import("./types").AnswerItem[]>(`/collections/${collectionId}/answers?limit=${limit}`),
+  listAnswers: (collectionId: string, limit = 500, sessionId?: string) =>
+    request<import("./types").AnswerItem[]>(
+      `/collections/${collectionId}/answers?limit=${limit}${sessionId ? `&session_id=${encodeURIComponent(sessionId)}` : ""}`
+    ),
   listImportBatches: (collectionId: string) => request<import("./types").ImportBatch[]>(`/collections/${collectionId}/import-batches`),
   collectionQuality: (collectionId: string) => request<import("./types").CollectionQuality>(`/collections/${collectionId}/quality`),
   meetingSummary: (collectionId: string, meetingDate?: string) =>
@@ -140,6 +162,27 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ strategies })
     }),
+  listEvaluationDatasets: (collectionId: string) =>
+    request<{ items: import("./types").EvaluationDataset[] }>(`/evaluation/datasets?collection_id=${collectionId}`),
+  createEvaluationDataset: (payload: { collection_id: string; name: string; description?: string }) =>
+    request<import("./types").EvaluationDataset>("/evaluation/datasets", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    }),
+  createEvaluationCase: (datasetId: string, payload: Record<string, unknown>) =>
+    request<{ id: string }>(`/evaluation/datasets/${datasetId}/cases`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    }),
+  runEvaluation: (datasetId: string, payload: Record<string, unknown> = {}) =>
+    request<import("./types").EvaluationRun>(`/evaluation/datasets/${datasetId}/runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    }),
+  getEvaluationRun: (runId: string) => request<import("./types").EvaluationRun>(`/evaluation/runs/${runId}`),
   uploadDocument: (collectionId: string, form: FormData) =>
     request<import("./types").DocumentItem>(`/collections/${collectionId}/documents`, {
       method: "POST",
@@ -160,20 +203,20 @@ export const api = {
     request<{ status: string; document_id: string }>(`/documents/${documentId}`, {
       method: "DELETE"
     }),
-  chat: (payload: { collection_id: string; question: string; history?: import("./types").ChatTurn[] }) =>
+  chat: (payload: import("./types").ChatPayload) =>
     request<import("./types").ChatResponse>("/chat", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload)
     }),
   chatStream: function(
-    payload: { collection_id: string; question: string; history?: import("./types").ChatTurn[] },
+    payload: import("./types").ChatPayload,
     onEvent: (event: import("./types").StreamEvent) => void,
     onDone: () => void,
     onError: (error: string) => void,
   ): AbortController {
     const controller = new AbortController();
-    const headers = new Headers({ "Content-Type": "application/json", "X-API-Key": API_KEY });
+    const headers = new Headers({ "Content-Type": "application/json" });
     const token = getAccessToken();
     if (token) headers.set("Authorization", `Bearer ${token}`);
 

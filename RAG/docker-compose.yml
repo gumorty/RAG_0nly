@@ -36,16 +36,25 @@ services:
     volumes:
       - minio_data:/data
     ports:
-      - "9100:9000"
-      - "9101:9001"
+      - "19100:9000"
+      - "19101:9001"
+    networks:
+      default:
+        aliases:
+          - llmstart-minio
 
   api:
     build:
       context: ./backend
     env_file:
       - .env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - default
+      - ragflow
     ports:
-      - "8010:8000"
+      - "18010:8000"
     depends_on:
       postgres:
         condition: service_healthy
@@ -76,12 +85,16 @@ services:
     build:
       context: ./frontend
     environment:
-      NEXT_PUBLIC_API_BASE_URL: http://localhost:8010
-      NEXT_PUBLIC_API_KEY: change-this-admin-api-key
+      NEXT_PUBLIC_API_BASE_URL: http://localhost:18010
     ports:
-      - "4070:3000"
+      - "14070:3000"
     depends_on:
       - api
+
+networks:
+  ragflow:
+    external: true
+    name: docker_ragflow
 
 volumes:
   postgres_data:

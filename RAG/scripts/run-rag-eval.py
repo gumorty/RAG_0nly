@@ -6,11 +6,19 @@ import time
 from pathlib import Path
 from urllib import error, request
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
+from app.rag.eval_metrics import (  # noqa: E402
+    citation_readability_rate,
+    duplicate_line_count,
+    keyword_answer_score,
+    unsupported_claim_heuristic,
+)
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run RAG answer-quality evaluation cases through the management API.")
     parser.add_argument("--evalset", default="evalsets/lab_weekly_rag_eval.json")
-    parser.add_argument("--api-base", default=os.getenv("RAG_API_BASE", "http://localhost:8010/api"))
+    parser.add_argument("--api-base", default=os.getenv("RAG_API_BASE", "http://localhost:18010/api"))
     parser.add_argument("--email", default=os.getenv("RAG_EVAL_EMAIL", "admin@example.com"))
     parser.add_argument("--password", default=os.getenv("RAG_EVAL_PASSWORD", "Admin@123456"))
     parser.add_argument("--out", default="data/eval/latest-rag-eval-report.json")
@@ -72,13 +80,13 @@ def run_case(api_base: str, token: str, collection_id: str, evalset: dict, case:
     answer = response.get("answer") or ""
     citations = response.get("citations") or []
     reasons = []
+    keyword_metrics = keyword_answer_score(answer, case.get("must_include", []), case.get("must_not_include", []))
+    unsupported_metrics = unsupported_claim_heuristic(answer, citations)
 
-    for keyword in case.get("must_include", []):
-        if keyword not in answer:
-            reasons.append(f"missing keyword in answer: {keyword}")
-    for keyword in case.get("must_not_include", []):
-        if keyword in answer:
-            reasons.append(f"forbidden text in answer: {keyword}")
+    for keyword in keyword_metrics["missing_keywords"]:
+        reasons.append(f"missing keyword in answer: {keyword}")
+    for keyword in keyword_metrics["forbidden_keywords"]:
+        reasons.append(f"forbidden text in answer: {keyword}")
 
     min_citations = int(case.get("min_citations", evalset.get("min_citations", 1)))
     if len(citations) < min_citations:
@@ -89,11 +97,11 @@ def run_case(api_base: str, token: str, collection_id: str, evalset: dict, case:
     if evidence_score < min_score:
         reasons.append(f"evidence score {evidence_score:.3f} < {min_score:.3f}")
 
-    unreadable = [c for c in citations if not readable_citation(c)]
-    if unreadable:
-        reasons.append(f"unreadable citations: {len(unreadable)}")
+    readability = citation_readability_rate(citations)
+    if citations and readability < float(case.get("min_citation_readability_rate", 1.0)):
+        reasons.append(f"citation readability {readability:.3f} below requirement")
 
-    duplicate_lines = count_duplicate_lines(answer)
+    duplicate_lines = duplicate_line_count(answer)
     if duplicate_lines:
         reasons.append(f"duplicate answer lines: {duplicate_lines}")
 
@@ -109,6 +117,11 @@ def run_case(api_base: str, token: str, collection_id: str, evalset: dict, case:
         "evidence_score": evidence_score,
         "citation_count": len(citations),
         "duplicate_lines": duplicate_lines,
+        "metrics": {
+            "keyword": keyword_metrics,
+            "citation_readability_rate": readability,
+            "unsupported_claim": unsupported_metrics,
+        },
         "citations": [
             {
                 "title": c.get("title"),

@@ -96,9 +96,34 @@ class RagFlowClient:
         """PUT /datasets/<dataset_id> — update dataset config (chunk_method, parser_config, …)."""
         return self._request("PUT", f"/datasets/{dataset_id}", json=updates)["data"]
 
+    def ensure_dataset_embedding(self, dataset_id: str) -> dict:
+        """Ensure an existing dataset uses the configured embedding model.
+
+        RAGFlow stores the embedding model on each dataset. Changing the tenant
+        default later does not repair old datasets, so uploads can keep failing
+        with the previous exhausted embedding provider unless we reconcile here.
+        """
+        dataset = self.get_dataset(dataset_id)
+        current = str(
+            dataset.get("embedding_model")
+            or dataset.get("embd_id")
+            or dataset.get("embedding_id")
+            or ""
+        )
+        expected = self.settings.ragflow_embedding_model
+        if current == expected:
+            return dataset
+        logger.info(
+            "Updating RAGFlow dataset %s embedding model from %s to %s",
+            dataset_id,
+            current or "<empty>",
+            expected,
+        )
+        return self.update_dataset(dataset_id, embedding_model=expected)
+
     def delete_dataset(self, dataset_id: str) -> None:
-        """DELETE /datasets/<dataset_id> — remove a dataset."""
-        self._request("DELETE", f"/datasets/{dataset_id}")
+        """DELETE /datasets — remove one dataset by id."""
+        self._request("DELETE", "/datasets", json={"ids": [dataset_id]})
 
     # ------------------------------------------------------------------
     # Document management
@@ -382,6 +407,12 @@ class RagFlowClient:
         """GET /chats/<chat_id>/sessions/<session_id> — get session messages + references."""
         return self._request("GET", f"/chats/{chat_id}/sessions/{session_id}")["data"]
 
+    def delete_sessions(self, chat_id: str, session_ids: list[str]) -> None:
+        """DELETE /chats/<chat_id>/sessions — delete one or more chat sessions."""
+        if not session_ids:
+            return
+        self._request("DELETE", f"/chats/{chat_id}/sessions", json={"ids": session_ids})
+
     # ------------------------------------------------------------------
     # Chat completions  (Phase 2)
     # ------------------------------------------------------------------
@@ -498,10 +529,19 @@ class RagFlowClient:
         return None
 
     def _request(self, method: str, path: str, **kwargs: Any) -> dict:
-        with httpx.Client(timeout=180) as client:
-            response = client.request(method, f"{self.base_url}{path}", headers=self.headers, **kwargs)
-        response.raise_for_status()
-        payload = response.json()
+        url = f"{self.base_url}{path}"
+        try:
+            with httpx.Client(timeout=180) as client:
+                response = client.request(method, url, headers=self.headers, **kwargs)
+            response.raise_for_status()
+            payload = response.json()
+        except httpx.HTTPStatusError as exc:
+            detail = exc.response.text[:800] if exc.response is not None else str(exc)
+            raise RagFlowError(f"RAGFlow HTTP {exc.response.status_code} {method} {path}: {detail}") from exc
+        except httpx.HTTPError as exc:
+            raise RagFlowError(f"RAGFlow request failed {method} {path}: {exc}") from exc
+        except ValueError as exc:
+            raise RagFlowError(f"RAGFlow returned non-JSON response for {method} {path}") from exc
         if payload.get("code") not in (0, None):
             raise RagFlowError(str(payload.get("message") or payload))
         return payload
@@ -514,24 +554,43 @@ class RagFlowClient:
         Yields dicts with at least the keys ``answer`` (str), ``reference`` (dict),
         and ``final`` (bool).
         """
-        kwargs["stream"] = True
+        # httpx.Client.stream() does not accept a 'stream' kwarg — remove it
+        # to avoid a TypeError when forwarding kwargs from chat_completion.
+        kwargs.pop("stream", None)
         with httpx.Client(timeout=300) as client:
             with client.stream(method, f"{self.base_url}{path}", headers=self.headers, **kwargs) as resp:
                 resp.raise_for_status()
                 for line in resp.iter_lines():
                     if not line:
                         continue
-                    if line.startswith("data: "):
+                    # RAGFlow SSE format: data:{...}  (NO space after colon)
+                    if line.startswith("data:"):
+                        data_str = line[5:]
+                    elif line.startswith("data: "):
                         data_str = line[6:]
-                        if data_str.strip() == "[DONE]":
+                    else:
+                        continue
+                    data_str = data_str.strip()
+                    if not data_str:
+                        continue
+                    # End-of-stream marker
+                    if data_str == "true" or data_str == "[DONE]":
+                        return
+                    try:
+                        event = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        logger.warning("RAGFlow SSE parse error: %s", line[:200])
+                        continue
+                    # RAGFlow wraps data in {"code": 0, "data": {...}}
+                    # When the stream ends, RAGFlow sends {"code": 0, "data": true}
+                    inner = event.get("data", event) if "code" in event else event
+                    if isinstance(inner, bool):
+                        return
+                    if "answer" not in inner and isinstance(inner, dict):
+                        inner = event.get("data", event)
+                        if isinstance(inner, bool):
                             return
-                        try:
-                            event = json.loads(data_str)
-                        except json.JSONDecodeError:
-                            logger.warning("RAGFlow SSE parse error: %s", line[:200])
-                            continue
-                        inner = event if "answer" in event else event.get("data", event)
-                        yield inner
+                    yield inner
 
     # ------------------------------------------------------------------
     # Legacy helpers (kept for compat during migration)

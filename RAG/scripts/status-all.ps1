@@ -12,4 +12,9 @@ try {
 
 Write-Host ""
 Write-Host "== RAGFlow engine =="
-docker compose -f (Join-Path $RagflowDocker "docker-compose.yml") ps
+Push-Location $RagflowDocker
+try {
+  docker compose --profile elasticsearch --profile gpu ps
+} finally {
+  Pop-Location
+}

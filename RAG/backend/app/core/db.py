@@ -46,12 +46,21 @@ def _apply_lightweight_migrations() -> None:
         migrations.append("ALTER TABLE users ADD COLUMN token_version INTEGER DEFAULT 1")
     if "last_login_at" not in columns:
         migrations.append("ALTER TABLE users ADD COLUMN last_login_at TIMESTAMP")
+    if "answers" in inspector.get_table_names():
+        answer_columns = {column["name"] for column in inspector.get_columns("answers")}
+        if "user_id" not in answer_columns:
+            migrations.append("ALTER TABLE answers ADD COLUMN user_id VARCHAR(36)")
+        if "session_id" not in answer_columns:
+            migrations.append("ALTER TABLE answers ADD COLUMN session_id VARCHAR(80)")
     if not migrations:
         return
     with engine.begin() as connection:
         for statement in migrations:
             connection.execute(text(statement))
         connection.execute(text("UPDATE users SET token_version = 1 WHERE token_version IS NULL"))
+        if "answers" in inspector.get_table_names():
+            connection.execute(text("CREATE INDEX IF NOT EXISTS ix_answers_user_id ON answers (user_id)"))
+            connection.execute(text("CREATE INDEX IF NOT EXISTS ix_answers_session_id ON answers (session_id)"))
 
 
 def _bootstrap_admin() -> None:
@@ -65,12 +74,13 @@ def _bootstrap_admin() -> None:
         existing = db.scalar(select(User).where(User.email == settings.bootstrap_admin_email))
         if existing:
             changed = False
-            if not existing.password_hash:
-                existing.password_hash = hash_password(settings.bootstrap_admin_password)
-                changed = True
-            if not existing.api_key_hash:
-                existing.api_key_hash = hash_api_key(settings.bootstrap_admin_api_key)
-                changed = True
+            # Local deployment convenience: keep the bootstrap administrator
+            # aligned with .env so the operator can always recover login.
+            existing.password_hash = hash_password(settings.bootstrap_admin_password)
+            existing.api_key_hash = hash_api_key(settings.bootstrap_admin_api_key)
+            existing.role = UserRole.admin
+            existing.is_active = True
+            changed = True
             if existing.token_version is None:
                 existing.token_version = 1
                 changed = True

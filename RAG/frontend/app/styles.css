@@ -426,6 +426,53 @@ button:focus-visible {
   color: var(--text);
 }
 
+.iconButton.danger {
+  color: var(--danger);
+}
+
+.sessionBar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+  padding: 0 clamp(18px, 6vw, 92px);
+  overflow-x: auto;
+  flex: 0 0 auto;
+}
+
+.sessionTab {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 132px;
+  max-width: 220px;
+  min-height: 36px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.72);
+  color: var(--muted);
+}
+
+.sessionTab span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sessionTab small {
+  margin-left: auto;
+  white-space: nowrap;
+  color: var(--muted);
+}
+
+.sessionTab.active,
+.sessionTab:not(:disabled):hover {
+  border-color: rgba(15, 138, 122, 0.36);
+  background: #f7fffc;
+  color: var(--accent-strong);
+}
+
 .errorBanner {
   margin-top: 12px;
   border: 1px solid rgba(185, 67, 67, 0.24);
@@ -888,6 +935,30 @@ button:focus-visible {
   color: #9f2f2f !important;
 }
 
+.errorDetails {
+  margin-top: 6px;
+  color: var(--danger);
+  overflow-wrap: anywhere;
+}
+
+.errorDetails summary {
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.errorDetails pre {
+  max-height: 180px;
+  margin: 8px 0 0;
+  overflow: auto;
+  white-space: pre-wrap;
+  border: 1px solid rgba(185, 67, 67, 0.18);
+  border-radius: 7px;
+  background: #fff6f6;
+  padding: 8px;
+  font-size: 12px;
+}
+
 .documentRow button {
   width: 30px;
   height: 30px;
@@ -1108,6 +1179,24 @@ button:focus-visible {
   .chatWorkspace {
     height: 100dvh;
   }
+}
+
+.evalToolbar {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.evalToolbar select,
+.evalToolbar button {
+  min-width: 0;
+}
+
+.evalFailureList {
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
 }
 
 @media (max-width: 900px) {

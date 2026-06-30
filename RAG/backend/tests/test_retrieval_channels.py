@@ -1,5 +1,5 @@
 from app.rag.schemas import RetrievedChunk
-from app.services.retrieval_channels import build_retrieval_channels, reciprocal_rank_fusion
+from app.services.retrieval_channels import build_retrieval_channels, detect_query_intent, reciprocal_rank_fusion
 
 
 def _chunk(chunk_id: str, content: str, score: float) -> RetrievedChunk:
@@ -48,3 +48,36 @@ def test_rrf_fuses_channels_and_keeps_channel_metadata():
     assert "semantic" in ranked[0].metadata["retrieval_channels"]
     assert "keyword_bm25" in ranked[0].metadata["retrieval_channels"]
     assert ranked[0].metadata["rrf_score"] > 0
+
+
+def test_build_retrieval_channels_adds_figure_channel():
+    channels = build_retrieval_channels(
+        "图6展示了什么？在哪一页？",
+        ["图6展示了什么？在哪一页？"],
+        {"page_size": 8, "similarity_threshold": 0.05, "vector_similarity_weight": 0.3},
+    )
+
+    names = {channel.name for channel in channels}
+    assert detect_query_intent("图6展示了什么？") == "figure"
+    assert "figure_index" in names
+
+
+def test_rrf_promotes_figure_index_over_catalog_for_figure_question():
+    channels = build_retrieval_channels(
+        "图6展示了什么？",
+        ["图6展示了什么？"],
+        {"page_size": 4, "similarity_threshold": 0.05, "vector_similarity_weight": 0.3},
+    )
+    figure = next(channel for channel in channels if channel.name == "figure_index")
+    semantic = channels[0]
+
+    ranked = reciprocal_rank_fusion(
+        [
+            (semantic, [_chunk("toc", "图目录 图 6 AI 应用产业链分布 ...... 35", 0.8)]),
+            (figure, [_chunk("fig", "# 图表检索索引\n## 图6 AI 应用产业链分布\n- 页码线索：第 35 页\n- 邻近文本：图6说明产业链分布", 0.5)]),
+        ],
+        limit=2,
+        question="图6展示了什么？",
+    )
+
+    assert ranked[0].chunk_id == "fig"

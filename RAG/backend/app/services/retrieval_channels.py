@@ -93,6 +93,22 @@ def build_retrieval_channels(
             )
         )
 
+    if intent == "figure":
+        figure_no = _extract_figure_no(question)
+        page_hint = _extract_page_hint(question)
+        hints = " ".join(item for item in (figure_no, page_hint) if item)
+        channels.append(
+            RetrievalChannel(
+                name="figure_index",
+                query=f"{question} {hints} 图表检索索引 图号 图题 图片 页码 邻近文本 图中内容",
+                vector_similarity_weight=0.15,
+                similarity_threshold=0.0,
+                page_size=max(base_page_size, 18),
+                rrf_weight=1.2,
+                description="图表/页码召回",
+            )
+        )
+
     if intent in {"section", "definition", "procedure"} or _looks_like_section_query(question):
         channels.append(
             RetrievalChannel(
@@ -122,6 +138,8 @@ def build_retrieval_channels(
 
 def detect_query_intent(question: str) -> str:
     text = question or ""
+    if _looks_like_figure_query(text):
+        return "figure"
     if any(term in text for term in ("表", "金额", "数量", "多少", "比例", "标准", "上浮", "浮动", "期间", "几月")):
         return "table" if any(term in text for term in ("表", "标准", "金额", "上浮", "浮动")) else "numeric"
     if any(term in text for term in ("是什么", "定义", "概念", "含义", "解释")):
@@ -165,7 +183,7 @@ def reciprocal_rank_fusion(
         chunk: RetrievedChunk = item["chunk"]
         deep_score = distilled_rank_score(question, chunk, item["channels"])
         combined = float(item["rrf"]) + deep_score
-        chunk.score = max(float(chunk.score or 0.0), combined)
+        chunk.score = max(float(chunk.score or 0.0), combined) + deep_score
         chunk.metadata = {
             **(chunk.metadata or {}),
             "retrieval_channels": sorted(set(item["channels"])),
@@ -189,7 +207,9 @@ def distilled_rank_score(question: str, chunk: RetrievedChunk, channels: list[st
     proximity = _term_proximity_bonus(content, terms)
     table_bonus = 0.05 if "table_row" in channels and "表格" in content else 0.0
     title_bonus = 0.04 if "title" in channels and any(term in chunk.title for term in terms) else 0.0
-    return min(0.28, coverage * 0.16 + proximity + table_bonus + title_bonus)
+    figure_bonus = _figure_rank_bonus(question, content, channels)
+    toc_penalty = _toc_penalty(question, content, channels)
+    return max(0.0, min(0.8, coverage * 0.16 + proximity + table_bonus + title_bonus + figure_bonus - toc_penalty))
 
 
 def _term_proximity_bonus(content: str, terms: list[str]) -> float:
@@ -230,6 +250,52 @@ def _expand_synonyms(question: str) -> list[str]:
 
 def _looks_like_section_query(question: str) -> bool:
     return bool(re.search(r"第[一二三四五六七八九十\d]+[章节条]|[一二三四五六七八九十\d]+、", question or ""))
+
+
+def _looks_like_figure_query(question: str) -> bool:
+    text = question or ""
+    if re.search(r"(图|图表|图片|插图|示意图|架构图|流程图|统计图|柱状图|折线图|Figure)\s*[一二三四五六七八九十百\d]?", text, flags=re.IGNORECASE):
+        return True
+    return any(term in text for term in ("图中", "这张图", "图里", "第几页", "页码", "图像", "截图"))
+
+
+def _extract_figure_no(question: str) -> str:
+    match = re.search(r"(图\s*[一二三四五六七八九十百\d]+(?:[-.]\d+)?|Figure\s*\d+(?:[-.]\d+)?)", question or "", flags=re.IGNORECASE)
+    return re.sub(r"\s+", "", match.group(1)) if match else ""
+
+
+def _extract_page_hint(question: str) -> str:
+    match = re.search(r"(?:第\s*)?(\d{1,4})\s*页", question or "")
+    return f"第{match.group(1)}页" if match else ""
+
+
+def _figure_rank_bonus(question: str, content: str, channels: list[str]) -> float:
+    if "figure_index" not in channels and detect_query_intent(question) != "figure":
+        return 0.0
+    bonus = 0.0
+    figure_no = _extract_figure_no(question)
+    page_hint = _extract_page_hint(question)
+    if "图表检索索引" in content:
+        bonus += 0.28
+    if figure_no and figure_no.replace(" ", "") in content.replace(" ", ""):
+        bonus += 0.16
+    if page_hint and page_hint in content:
+        bonus += 0.06
+    if any(term in content for term in ("邻近文本", "图片引用", "图中", "图题")):
+        bonus += 0.05
+    return min(bonus, 0.55)
+
+
+def _toc_penalty(question: str, content: str, channels: list[str]) -> float:
+    if "figure_index" not in channels and detect_query_intent(question) != "figure":
+        return 0.0
+    compact = content.replace(" ", "")
+    if "图表检索索引" in compact:
+        return 0.0
+    toc_like = bool(re.search(r"目录|图目录|图目\s*录|\.{3,}\s*\d{1,4}", compact))
+    if toc_like and len(compact) < 900:
+        return 0.24
+    return 0.0
 
 
 def _dedupe_channels(channels: list[RetrievalChannel]) -> list[RetrievalChannel]:

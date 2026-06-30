@@ -16,6 +16,7 @@ from app.rag.schemas import ChatRequest, ChatResponse, ChatTurn, RetrievalStrate
 from app.ragflow.client import RagFlowClient, RagFlowError
 from app.services.chunk_cache import local_bm25_search, sync_cache_from_retrieved_chunks
 from app.services.retrieval_channels import RetrievalChannel, build_retrieval_channels, reciprocal_rank_fusion
+from app.services.visual_assets import local_visual_search
 
 logger = logging.getLogger(__name__)
 
@@ -696,6 +697,33 @@ class ChatService:
                     "raw": {"source": "retrieval_chunk_cache", "count": len(local_chunks)},
                 }
             )
+        visual_chunks = local_visual_search(
+            self.db,
+            collection_id=collection.id,
+            query=" ".join(queries),
+            top_k=max(6, min(page_size, 12)),
+            acl_principals=acl_principals,
+        )
+        if visual_chunks:
+            visual_channel = RetrievalChannel(
+                name="local_visual_embedding",
+                query=" ".join(queries),
+                vector_similarity_weight=0.0,
+                similarity_threshold=0.0,
+                page_size=len(visual_chunks),
+                rrf_weight=1.1,
+                description="本地图片/扫描件/图表多模态向量召回",
+            )
+            channel_runs.append((visual_channel, visual_chunks))
+            raw_runs.append(
+                {
+                    "channel": visual_channel.name,
+                    "query": visual_channel.query,
+                    "description": visual_channel.description,
+                    "page_size": visual_channel.page_size,
+                    "raw": {"source": "visual_asset_cache", "count": len(visual_chunks)},
+                }
+            )
         if not channel_runs:
             raise RagFlowError("All RAGFlow retrieval channels failed and local chunk cache is empty.")
         fused = reciprocal_rank_fusion(channel_runs, limit=max(page_size * 2, page_size), question=" ".join(queries))
@@ -1184,7 +1212,8 @@ def _focus_evidence_for_question(question: str, content: str, limit: int = 5200)
     if repaired:
         return repaired
     rows = [line.strip() for line in text.splitlines() if line.strip()]
-    is_row_like_table = any(" | " in row for row in rows)
+    table_index_present = any(_contains_table_row_index(row) for row in rows)
+    is_row_like_table = table_index_present or any(" | " in row for row in rows)
     if len(rows) <= 3 and not is_row_like_table:
         return text if len(text) <= limit else text[:limit]
     terms = _query_focus_terms(question)
@@ -1196,16 +1225,20 @@ def _focus_evidence_for_question(question: str, content: str, limit: int = 5200)
     focused = "\n".join(deduped)
     if len(focused) > limit:
         focused = focused[:limit]
-    if is_row_like_table:
+    is_travel_policy = _is_travel_policy_context(question, focused)
+    if is_row_like_table and is_travel_policy:
         guard = _table_guardrail_for_question(question, focused)
+        prefix = (
+            "以下是从长表格/长片段中按当前问题筛出的相关行。"
+            "如果某个地区行没有明确给出旺季期间或上浮金额，不得从相邻地区推断。"
+        )
+    elif is_row_like_table:
+        guard = ""
+        prefix = "以下是从长表格/长片段中按当前问题筛出的相关行。"
     else:
         guard = ""
-    return (
-        "以下是从长表格/长片段中按当前问题筛出的相关行。"
-        "如果某个地区行没有明确给出旺季期间或上浮金额，不得从相邻地区推断。"
-        f"{guard}\n"
-        f"{focused}"
-    )
+        prefix = "以下是从长片段中按当前问题筛出的相关内容。"
+    return f"{prefix}{guard}\n{focused}"
 
 
 def _select_relevant_evidence_rows(question: str, rows: list[str], terms: set[str]) -> list[str]:
@@ -1264,6 +1297,8 @@ def _evidence_row_score(question: str, row: str, terms: set[str], *, table_index
 
 
 def _table_guardrail_for_question(question: str, focused: str) -> str:
+    if not _is_travel_policy_context(question, focused):
+        return ""
     asked_season_or_float = any(term in question for term in ("旺季", "浮动", "上浮", "调整"))
     if not asked_season_or_float:
         return ""
@@ -1271,6 +1306,26 @@ def _table_guardrail_for_question(question: str, focused: str) -> str:
     if has_explicit_field:
         return ""
     return " 当前筛出的相关行没有出现旺季/浮动/上浮字段，回答时必须说明证据未提供具体浮动信息。"
+
+
+def _is_travel_policy_context(question: str, evidence: str = "") -> bool:
+    text = f"{question or ''}\n{evidence or ''}"
+    has_travel_domain = any(term in text for term in ("差旅", "住宿费", "住宿标准", "差旅住宿", "中央和国家机关"))
+    has_policy_field = any(term in text for term in ("旺季", "上浮", "浮动", "司局级", "部级", "其他人员", "伙食补助", "交通费"))
+    if has_travel_domain and has_policy_field:
+        return True
+    asked_policy_float = any(term in (question or "") for term in ("旺季", "上浮", "浮动"))
+    return asked_policy_float and _looks_like_travel_standard_table(evidence)
+
+
+def _looks_like_travel_standard_table(evidence: str) -> bool:
+    text = evidence or ""
+    has_known_region = any(
+        term in text
+        for term in ("新疆", "广西", "青海", "海南", "西藏", "河北", "拉萨", "桂林", "北海", "乌鲁木齐")
+    )
+    numeric_cells = len(re.findall(r"(?:^|[|；\s])\d{2,4}(?:[.-]\d+月)?", text))
+    return has_known_region and (" | " in text or "；" in text or "=" in text) and numeric_cells >= 3
 
 
 def _trim_row_around_terms(row: str, terms: set[str], window: int = 420) -> str:
@@ -1293,6 +1348,9 @@ def _trim_row_around_terms(row: str, terms: set[str], window: int = 420) -> str:
 def _query_focus_terms(question: str) -> set[str]:
     text = question or ""
     terms = {term for term in re.findall(r"[\u4e00-\u9fffA-Za-z0-9]{2,}", text) if len(term) >= 2}
+    for match in re.findall(r"[\u4e00-\u9fff]{2,10}(?:市|州|县|区|地区)", text):
+        terms.add(match)
+        terms.add(match.rstrip("市州县区"))
     for token in re.findall(r"[\u4e00-\u9fff]{2}", text):
         terms.add(token)
     alias_terms: set[str] = set()
@@ -1342,7 +1400,7 @@ def _known_policy_table_repair(question: str, text: str) -> str:
     easy to misread. This helper extracts a conservative, province-specific
     evidence block when there is enough text to do so.
     """
-    if "广西" not in question:
+    if "广西" not in question or not _is_travel_policy_context(question, text):
         return ""
     compact = " ".join((text or "").split())
     if not all(term in compact for term in ("桂林市", "北海市", "1-2月", "7-9月", "1040", "610", "430")):

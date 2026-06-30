@@ -158,6 +158,32 @@ class RetrievalChunkCache(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class VisualAssetCache(Base):
+    __tablename__ = "visual_asset_cache"
+    __table_args__ = (
+        UniqueConstraint("document_id", "asset_id", name="uq_visual_asset_document_asset"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    collection_id: Mapped[str] = mapped_column(ForeignKey("collections.id"), index=True)
+    document_id: Mapped[str] = mapped_column(ForeignKey("documents.id"), index=True)
+    asset_id: Mapped[str] = mapped_column(String(120), index=True)
+    asset_type: Mapped[str] = mapped_column(String(40), index=True)
+    filename: Mapped[str | None] = mapped_column(String(700))
+    object_key: Mapped[str | None] = mapped_column(String(900))
+    source_path: Mapped[str | None] = mapped_column(String(900))
+    page_no: Mapped[str | None] = mapped_column(String(80), index=True)
+    figure_no: Mapped[str | None] = mapped_column(String(80), index=True)
+    caption: Mapped[str | None] = mapped_column(Text)
+    context: Mapped[str | None] = mapped_column(Text)
+    embedding: Mapped[list[float] | None] = mapped_column(JSON)
+    embedding_model: Mapped[str | None] = mapped_column(String(200))
+    metadata_: Mapped[dict] = mapped_column("metadata", JSON, default=dict)
+    available: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class DomainLexiconTerm(Base):
     __tablename__ = "domain_lexicon_terms"
 

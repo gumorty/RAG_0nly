@@ -75,6 +75,16 @@ class Settings(BaseSettings):
     mineru_pdf_ocr_mode: str = Field(default="auto", pattern="^(auto|always|never)$")
     table_row_index_enabled: bool = True
     table_row_index_max_rows: int = Field(default=5000, ge=100, le=50000)
+    visual_asset_index_enabled: bool = True
+    visual_asset_max_images: int = Field(default=40, ge=0, le=500)
+    visual_asset_max_image_mb: int = Field(default=8, ge=1, le=50)
+    visual_asset_max_json_chars: int = Field(default=120000, ge=1000, le=2000000)
+    visual_embedding_enabled: bool = False
+    visual_embedding_base_url: str = "https://api.siliconflow.cn/v1"
+    visual_embedding_api_key: str = ""
+    visual_embedding_model: str = "Qwen/Qwen3-VL-Embedding-8B"
+    visual_embedding_dimensions: int = Field(default=1024, ge=64, le=4096)
+    visual_embedding_timeout_seconds: int = Field(default=120, ge=5, le=600)
 
     sciverse_enabled: bool = False
     sciverse_base_url: str = "https://api.sciverse.space"

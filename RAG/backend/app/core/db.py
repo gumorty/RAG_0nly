@@ -74,12 +74,13 @@ def _bootstrap_admin() -> None:
         existing = db.scalar(select(User).where(User.email == settings.bootstrap_admin_email))
         if existing:
             changed = False
-            if not existing.password_hash:
-                existing.password_hash = hash_password(settings.bootstrap_admin_password)
-                changed = True
-            if not existing.api_key_hash:
-                existing.api_key_hash = hash_api_key(settings.bootstrap_admin_api_key)
-                changed = True
+            # Local deployment convenience: keep the bootstrap administrator
+            # aligned with .env so the operator can always recover login.
+            existing.password_hash = hash_password(settings.bootstrap_admin_password)
+            existing.api_key_hash = hash_api_key(settings.bootstrap_admin_api_key)
+            existing.role = UserRole.admin
+            existing.is_active = True
+            changed = True
             if existing.token_version is None:
                 existing.token_version = 1
                 changed = True

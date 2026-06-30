@@ -156,9 +156,17 @@ export default function HomePage() {
   });
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [workspaceLoading, setWorkspaceLoading] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const streamEndRef = useRef<HTMLDivElement | null>(null);
+  const streamAbortRef = useRef<AbortController | null>(null);
+  const streamControllersRef = useRef<Record<string, AbortController>>({});
+  const [pendingChats, setPendingChats] = useState<Record<string, boolean>>({});
+  const selectedIdRef = useRef("");
+  const activeSessionIdRef = useRef("");
+  const loadSeqRef = useRef(0);
+  const chatSeqRef = useRef(0);
 
   const selectedCollection = useMemo(
     () => collections.find((collection) => collection.id === selectedId),
@@ -170,6 +178,16 @@ export default function HomePage() {
   const readyRatio = quality && quality.document_count > 0
     ? Math.round((quality.ready_count / quality.document_count) * 100)
     : 0;
+  const activeChatKey = selectedId && activeSessionId ? makeChatKey(selectedId, activeSessionId) : "";
+  const chatBusy = Boolean(activeChatKey && pendingChats[activeChatKey]);
+
+  useEffect(() => {
+    selectedIdRef.current = selectedId;
+  }, [selectedId]);
+
+  useEffect(() => {
+    activeSessionIdRef.current = activeSessionId;
+  }, [activeSessionId]);
 
   useEffect(() => {
     if (!auth.getAccessToken()) {
@@ -191,15 +209,21 @@ export default function HomePage() {
 
   useEffect(() => {
     if (!user) return;
+    const seq = ++loadSeqRef.current;
+    setWorkspaceLoading(true);
     setMessages([]);
     setSessions([]);
     setActiveSessionId("");
-    loadSelectedCollection(selectedId).catch((err) => setError(err instanceof Error ? err.message : "加载知识库详情失败"));
+    loadSelectedCollection(selectedId, seq).catch((err) => {
+      if (seq === loadSeqRef.current) setError(err instanceof Error ? err.message : "加载知识库详情失败");
+    }).finally(() => {
+      if (seq === loadSeqRef.current) setWorkspaceLoading(false);
+    });
   }, [selectedId, user]);
 
   useEffect(() => {
     streamEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [messages, busy]);
+  }, [messages, chatBusy]);
 
   useEffect(() => {
     if (!user || !selectedId) return;
@@ -225,7 +249,29 @@ export default function HomePage() {
     if (!selectedId && items[0]) setSelectedId(items[0].id);
   }
 
-  async function loadWorkspace(collectionId = selectedId) {
+  function abortActiveStream() {
+    Object.values(streamControllersRef.current).forEach((controller) => controller.abort());
+    streamControllersRef.current = {};
+    streamAbortRef.current = null;
+    chatSeqRef.current += 1;
+    setPendingChats({});
+  }
+
+  function makeChatKey(collectionId: string, sessionId: string) {
+    return `${collectionId}:${sessionId}`;
+  }
+
+  function setChatPending(collectionId: string, sessionId: string, pending: boolean) {
+    const key = makeChatKey(collectionId, sessionId);
+    setPendingChats((items) => {
+      if (pending) return { ...items, [key]: true };
+      const next = { ...items };
+      delete next[key];
+      return next;
+    });
+  }
+
+  async function loadWorkspace(collectionId = selectedId, seq = loadSeqRef.current) {
     if (!collectionId) {
       setDocuments([]);
       setBatches([]);
@@ -243,6 +289,7 @@ export default function HomePage() {
       api.listImportBatches(collectionId).catch(() => []),
       api.listEvaluationDatasets(collectionId).then((res) => res.items).catch(() => [])
     ]);
+    if (seq !== loadSeqRef.current || collectionId !== selectedIdRef.current) return;
     setDocuments(nextDocuments);
     setQuality(nextQuality);
     setSummary(nextSummary);
@@ -253,27 +300,31 @@ export default function HomePage() {
       : nextEvaluationDatasets[0]?.id || "");
   }
 
-  async function loadSelectedCollection(collectionId = selectedId) {
+  async function loadSelectedCollection(collectionId = selectedId, seq = loadSeqRef.current) {
     if (!collectionId) {
       setMessages([]);
       setSessions([]);
       setActiveSessionId("");
       return;
     }
-    await loadWorkspace(collectionId);
+    await loadWorkspace(collectionId, seq);
+    if (seq !== loadSeqRef.current || collectionId !== selectedIdRef.current) return;
     const nextSessions = await api.listChatSessions(collectionId).catch(() => []);
     const active = nextSessions[0] || await api.createChatSession(collectionId, "新对话");
+    if (seq !== loadSeqRef.current || collectionId !== selectedIdRef.current) return;
     setSessions(nextSessions.length ? nextSessions : [active]);
+    activeSessionIdRef.current = active.session_id;
     setActiveSessionId(active.session_id);
-    await loadConversation(collectionId, active.session_id);
+    await loadConversation(collectionId, active.session_id, seq);
   }
 
-  async function loadConversation(collectionId = selectedId, sessionId = activeSessionId) {
+  async function loadConversation(collectionId = selectedId, sessionId = activeSessionId, seq = loadSeqRef.current) {
     if (!collectionId || !sessionId) {
       setMessages([]);
       return;
     }
     const answers = await api.listAnswers(collectionId, 1000, sessionId).catch(() => []);
+    if (seq !== loadSeqRef.current || collectionId !== selectedIdRef.current || sessionId !== activeSessionIdRef.current) return;
     const restored: ChatMessage[] = [];
     for (const answer of answers) {
       restored.push({ id: `${answer.id}-question`, role: "user", content: answer.question });
@@ -297,11 +348,17 @@ export default function HomePage() {
   }
 
   async function logout() {
+    abortActiveStream();
     await auth.logout();
     setUser(null);
     setCollections([]);
     setSelectedId("");
+    selectedIdRef.current = "";
+    setActiveSessionId("");
+    activeSessionIdRef.current = "";
     setMessages([]);
+    setSessions([]);
+    setBusy(false);
   }
 
   async function refreshAll() {
@@ -325,11 +382,15 @@ export default function HomePage() {
     const ok = window.confirm(`确认删除知识库「${selectedCollection.name}」？这会删除本地文档、会话、问答记录，并同步删除 RAGFlow dataset。`);
     if (!ok) return;
     await runAction(async () => {
+      abortActiveStream();
       await api.deleteCollection(selectedId);
       setMessages([]);
       setSessions([]);
       setActiveSessionId("");
+      activeSessionIdRef.current = "";
       setSelectedId("");
+      selectedIdRef.current = "";
+      setBusy(false);
       await loadCollections();
       setNotice("知识库已删除，关联会话、问答记录和索引已清理。");
     }, "删除知识库失败");
@@ -338,9 +399,12 @@ export default function HomePage() {
   async function createNewSession() {
     if (!selectedId) return;
     await runAction(async () => {
+      const seq = ++loadSeqRef.current;
       const session = await api.createChatSession(selectedId, "新对话");
+      if (seq !== loadSeqRef.current || selectedId !== selectedIdRef.current) return;
       const nextSessions = [session, ...sessions.filter((item) => item.session_id !== session.session_id)];
       setSessions(nextSessions);
+      activeSessionIdRef.current = session.session_id;
       setActiveSessionId(session.session_id);
       setMessages([]);
     }, "新建对话失败");
@@ -348,9 +412,11 @@ export default function HomePage() {
 
   async function switchSession(sessionId: string) {
     if (!selectedId || sessionId === activeSessionId) return;
+    const seq = ++loadSeqRef.current;
+    activeSessionIdRef.current = sessionId;
     setActiveSessionId(sessionId);
     setMessages([]);
-    await loadConversation(selectedId, sessionId);
+    await loadConversation(selectedId, sessionId, seq);
   }
 
   async function deleteCurrentSession() {
@@ -358,15 +424,20 @@ export default function HomePage() {
     const ok = window.confirm("确认删除当前对话？该对话中的问答历史和检索 trace 会从数据库中删除。");
     if (!ok) return;
     await runAction(async () => {
+      abortActiveStream();
+      const seq = ++loadSeqRef.current;
       await api.deleteChatSession(selectedId, activeSessionId);
       const remaining = sessions.filter((item) => item.session_id !== activeSessionId);
       if (remaining.length > 0) {
         setSessions(remaining);
+        activeSessionIdRef.current = remaining[0].session_id;
         setActiveSessionId(remaining[0].session_id);
-        await loadConversation(selectedId, remaining[0].session_id);
+        await loadConversation(selectedId, remaining[0].session_id, seq);
       } else {
         const session = await api.createChatSession(selectedId, "新对话");
+        if (seq !== loadSeqRef.current || selectedId !== selectedIdRef.current) return;
         setSessions([session]);
+        activeSessionIdRef.current = session.session_id;
         setActiveSessionId(session.session_id);
         setMessages([]);
       }
@@ -419,25 +490,39 @@ export default function HomePage() {
     event?.preventDefault();
     const text = (preset || question).trim();
     if (!selectedId || !text) return;
+    const requestCollectionId = selectedId;
     let sessionId = activeSessionId;
     if (!sessionId) {
-      const session = await api.createChatSession(selectedId, "新对话");
+      const session = await api.createChatSession(requestCollectionId, "新对话");
+      if (requestCollectionId !== selectedIdRef.current) return;
       sessionId = session.session_id;
+      activeSessionIdRef.current = sessionId;
       setActiveSessionId(sessionId);
       setSessions((items) => [session, ...items.filter((item) => item.session_id !== session.session_id)]);
     }
     const history = toChatHistory(messages);
     const userMessage: ChatMessage = { id: crypto.randomUUID(), role: "user", content: text };
     const assistantId = crypto.randomUUID();
+    const chatSeq = ++chatSeqRef.current;
+    const requestChatKey = makeChatKey(requestCollectionId, sessionId);
+    streamControllersRef.current[requestChatKey]?.abort();
+    delete streamControllersRef.current[requestChatKey];
     setMessages((items) => [...items, userMessage]);
     setQuestion("");
-    setBusy(true);
+    setChatPending(requestCollectionId, sessionId, true);
     setError("");
+
+    const isCurrentChat = () => (
+      chatSeq === chatSeqRef.current
+      && requestCollectionId === selectedIdRef.current
+      && sessionId === activeSessionIdRef.current
+    );
 
     try {
       const controller = api.chatStream(
-        { collection_id: selectedId, question: text, session_id: sessionId, history },
+        { collection_id: requestCollectionId, question: text, session_id: sessionId, history },
         (event) => {
+          if (!isCurrentChat()) return;
           if (event.answer) {
             const answerText = event.answer;
             setMessages((items) => {
@@ -475,10 +560,16 @@ export default function HomePage() {
           }
         },
         () => {
-          setBusy(false);
-          refreshAfterChat();
+          delete streamControllersRef.current[requestChatKey];
+          setChatPending(requestCollectionId, sessionId, false);
+          if (!isCurrentChat()) return;
+          streamAbortRef.current = null;
+          refreshAfterChat(requestCollectionId, sessionId, chatSeq);
         },
         (errMsg) => {
+          delete streamControllersRef.current[requestChatKey];
+          setChatPending(requestCollectionId, sessionId, false);
+          if (!isCurrentChat()) return;
           setMessages((items) => {
             const updated = [...items];
             const last = updated[updated.length - 1];
@@ -487,32 +578,48 @@ export default function HomePage() {
             }
             return updated;
           });
-          setBusy(false);
+          streamAbortRef.current = null;
         }
       );
-      // Store controller for abort
+      streamControllersRef.current[requestChatKey] = controller;
+      streamAbortRef.current = controller;
       (window as unknown as Record<string, unknown>).__chatAbort = controller;
     } catch {
       // fallback to non-streaming
       try {
-        const response = await api.chat({ collection_id: selectedId, question: text, session_id: sessionId, history });
+        const response = await api.chat({ collection_id: requestCollectionId, question: text, session_id: sessionId, history });
+        if (!isCurrentChat()) return;
         setMessages((items) => [...items, toAssistantMessage(response)]);
-        await refreshAfterChat();
+        await refreshAfterChat(requestCollectionId, sessionId, chatSeq);
       } catch (err) {
-        setError(err instanceof Error ? err.message : "问答检索失败");
+        if (isCurrentChat()) {
+          setError(err instanceof Error ? err.message : "问答检索失败");
+        }
       } finally {
-        setBusy(false);
+        setChatPending(requestCollectionId, sessionId, false);
+        delete streamControllersRef.current[requestChatKey];
+        if (isCurrentChat()) {
+          streamAbortRef.current = null;
+        }
       }
     }
   }
 
-  async function refreshAfterChat() {
+  async function refreshAfterChat(
+    collectionId = selectedIdRef.current,
+    sessionId = activeSessionIdRef.current,
+    chatSeq = chatSeqRef.current
+  ) {
+    if (!collectionId) return;
+    const seq = loadSeqRef.current;
     await Promise.all([
       loadCollections(),
-      loadWorkspace(),
-      selectedId && activeSessionId ? loadConversation(selectedId, activeSessionId) : Promise.resolve(),
-      api.knowledgeGaps(selectedId).then((items) => {
-        setGaps((all) => [...all.filter((gap) => gap.collection_id !== selectedId), ...items]);
+      loadWorkspace(collectionId, seq),
+      sessionId ? loadConversation(collectionId, sessionId, seq) : Promise.resolve(),
+      api.knowledgeGaps(collectionId).then((items) => {
+        if (chatSeq === chatSeqRef.current && collectionId === selectedIdRef.current) {
+          setGaps((all) => [...all.filter((gap) => gap.collection_id !== collectionId), ...items]);
+        }
       }).catch(() => undefined)
     ]);
   }
@@ -727,7 +834,7 @@ export default function HomePage() {
             <StatusPill icon={<ShieldCheck size={14} />} label={`可检索率 ${readyRatio}%`} />
             <StatusPill icon={<Layers3 size={14} />} label={`${quality?.total_chunks ?? 0} 个分块`} />
             <button className="iconButton" onClick={createNewSession} disabled={busy || !selectedId} type="button" aria-label="新建对话"><MessageSquareText size={18} /></button>
-            <button className="iconButton danger" onClick={deleteCurrentSession} disabled={busy || !activeSessionId} type="button" aria-label="删除当前对话"><Trash2 size={18} /></button>
+            <button className="iconButton danger" onClick={deleteCurrentSession} disabled={busy || chatBusy || !activeSessionId} type="button" aria-label="删除当前对话"><Trash2 size={18} /></button>
             <button className="iconButton danger" onClick={deleteCurrentCollection} disabled={busy || !selectedId} type="button" aria-label="删除当前知识库"><Database size={18} /></button>
             <button className="iconButton" onClick={refreshAll} disabled={busy} type="button" aria-label="刷新数据"><RefreshCw size={18} /></button>
           </div>
@@ -747,13 +854,18 @@ export default function HomePage() {
             >
               <span>{safeDisplayText(session.title || `对话 ${session.session_id.slice(0, 6)}`, "新对话")}</span>
               <small>{session.turn_count} 轮</small>
+              {pendingChats[makeChatKey(session.collection_id, session.session_id)] && <small>回答中</small>}
             </button>
           ))}
-          {sessions.length === 0 && <span className="emptyHint">暂无对话。</span>}
+          {workspaceLoading && sessions.length === 0 && <span className="emptyHint">正在加载对话...</span>}
+          {!workspaceLoading && sessions.length === 0 && <span className="emptyHint">暂无对话。</span>}
         </div>
 
         <div className="chatStream" aria-live="polite">
-          {messages.length === 0 && (
+          {workspaceLoading && messages.length === 0 && (
+            <div className="loadingLine"><Loader2 size={16} /> 正在加载对话...</div>
+          )}
+          {!workspaceLoading && messages.length === 0 && (
             <EmptyConversation
               title={selectedCollection ? "开始向知识库提问" : "先创建或选择知识库"}
               description={selectedCollection ? "系统会执行混合检索、证据评分、引用溯源，并把低证据问题沉淀为知识缺口。" : "导入资料后，就可以在这里进行带证据引用的企业知识问答。"}
@@ -774,17 +886,17 @@ export default function HomePage() {
               </div>
             </article>
           ))}
-          {busy && <div className="loadingLine"><Loader2 size={16} /> 正在处理...</div>}
+          {chatBusy && <div className="loadingLine"><Loader2 size={16} /> 正在处理...</div>}
           <div ref={streamEndRef} />
         </div>
 
         <div className="quickPrompts" aria-label="快捷问题">
-          {quickQuestions.map((item) => <button key={item} type="button" disabled={!selectedId || busy} onClick={() => ask(undefined, item)}>{item}</button>)}
+          {quickQuestions.map((item) => <button key={item} type="button" disabled={!selectedId || workspaceLoading || chatBusy} onClick={() => ask(undefined, item)}>{item}</button>)}
         </div>
 
         <form className="composer" onSubmit={(event) => ask(event)}>
           <textarea value={question} onKeyDown={submitOnEnter} onChange={(event) => setQuestion(event.target.value)} placeholder="输入问题，例如：本周完成了什么？风险有哪些？下一步计划是什么？" aria-label="向当前知识库提问" rows={3} />
-          <button className="sendButton" disabled={busy || !selectedId || !question.trim()} type="submit" aria-label="发送问题"><Send size={18} /></button>
+          <button className="sendButton" disabled={workspaceLoading || chatBusy || !selectedId || !question.trim()} type="submit" aria-label="发送问题"><Send size={18} /></button>
         </form>
       </section>
 
@@ -854,6 +966,9 @@ export default function HomePage() {
                 <Metric label="MRR" value={formatMetric(evaluationRun.metrics.mrr)} />
                 <Metric label="NDCG" value={formatMetric(evaluationRun.metrics.ndcg_at_k)} />
                 <Metric label="引用可读" value={formatMetric(evaluationRun.metrics.citation_readability)} />
+                <Metric label="证据污染" value={formatMetric(evaluationRun.metrics.evidence_pollution_rate)} tone={Number(evaluationRun.metrics.evidence_pollution_rate || 0) > 0 ? "warn" : undefined} />
+                <Metric label="目录过排" value={formatMetric(evaluationRun.metrics.toc_over_rank_rate)} tone={Number(evaluationRun.metrics.toc_over_rank_rate || 0) > 0.2 ? "warn" : undefined} />
+                <Metric label="图表命中" value={formatMetric(evaluationRun.metrics.figure_hit_rate)} />
               </div>
               <div className="evalFailureList">
                 {evaluationRun.results.filter((item) => !item.passed).slice(0, 4).map((item) => (
@@ -867,7 +982,7 @@ export default function HomePage() {
               </div>
             </>
           ) : (
-            <div className="emptyHint">选择测评集后运行，查看 recall/MRR/NDCG/faithfulness/引用可读率。</div>
+            <div className="emptyHint">选择测评集后运行，查看 recall/MRR/NDCG/faithfulness/引用可读率、证据污染、目录过排和图表命中。</div>
           )}
           {selectedGaps.length > 0 && (
             <button className="textButton" type="button" onClick={() => addGapToEvaluation(selectedGaps[0])} disabled={!activeEvaluationDatasetId || evaluationBusy}>

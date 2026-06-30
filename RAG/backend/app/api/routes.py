@@ -75,9 +75,16 @@ from app.models.entities import (
     RetrievalTrace,
     User,
     UserRole,
+    VisualAssetCache,
 )
 from app.rag.evaluation import EvaluationService
-from app.rag.eval_metrics import citation_readability_rate, retrieval_metrics
+from app.rag.eval_metrics import (
+    citation_readability_rate,
+    evidence_pollution_rate,
+    figure_hit_rate,
+    retrieval_metrics,
+    toc_over_rank_rate,
+)
 from app.rag.normalize import sha256_bytes
 from app.rag.schemas import ChatRequest, ChatResponse, RetrievalStrategy
 from app.ragflow.chunk_method import select_chunk_method
@@ -85,6 +92,7 @@ from app.ragflow.client import RagFlowClient, RagFlowError
 from app.services.batch_ingest import read_zip_documents
 from app.services.parser_router import prepare_for_ragflow
 from app.services.chunk_cache import local_bm25_search, sync_ready_document_chunks
+from app.services.visual_assets import sync_visual_assets
 from app.workers.ragflow_ingestion import start_background_monitor
 
 router = APIRouter()
@@ -156,6 +164,9 @@ def register(payload: RegisterIn, db: Session = Depends(get_db)) -> TokenPairOut
 @router.post("/auth/login", response_model=TokenPairOut)
 def login(payload: LoginIn, db: Session = Depends(get_db)) -> TokenPairOut:
     username = _normalize_username(payload.username or payload.email)
+    settings = get_settings()
+    if username in {"admin", _normalize_username(settings.bootstrap_admin_name), _normalize_username(settings.bootstrap_admin_email)}:
+        username = _normalize_username(settings.bootstrap_admin_email)
     user = db.scalar(select(User).where(User.email == username, User.is_active.is_(True)))
     if not user or not verify_password(payload.password, user.password_hash):
         raise HTTPException(status_code=401, detail="用户名或密码不正确")
@@ -504,6 +515,13 @@ def delete_collection(
             storage.remove_object(document.object_key)
         except Exception:
             logger.warning("Object storage cleanup skipped for %s", document.object_key, exc_info=True)
+    visual_assets = db.scalars(select(VisualAssetCache).where(VisualAssetCache.collection_id == collection_id)).all()
+    for asset in visual_assets:
+        if asset.object_key:
+            try:
+                storage.remove_object(asset.object_key)
+            except Exception:
+                logger.warning("Visual asset cleanup skipped for %s", asset.object_key, exc_info=True)
 
     answers = db.scalars(select(Answer).where(Answer.collection_id == collection_id)).all()
     trace_ids = [answer.trace_id for answer in answers if answer.trace_id]
@@ -522,6 +540,7 @@ def delete_collection(
     db.query(EvalCase).filter(EvalCase.collection_id == collection_id).delete(synchronize_session=False)
     db.query(DomainLexiconTerm).filter(DomainLexiconTerm.collection_id == collection_id).delete(synchronize_session=False)
     db.query(RetrievalChunkCache).filter(RetrievalChunkCache.collection_id == collection_id).delete(synchronize_session=False)
+    db.query(VisualAssetCache).filter(VisualAssetCache.collection_id == collection_id).delete(synchronize_session=False)
     db.query(ImportBatch).filter(ImportBatch.collection_id == collection_id).delete(synchronize_session=False)
     db.query(RagflowSession).filter(RagflowSession.collection_id == collection_id).delete(synchronize_session=False)
     db.query(Chunk).filter(Chunk.collection_id == collection_id).delete(synchronize_session=False)
@@ -1014,8 +1033,17 @@ def delete_document(
         ObjectStorage().remove_object(document.object_key)
     except Exception:
         pass
+    visual_assets = db.scalars(select(VisualAssetCache).where(VisualAssetCache.document_id == document.id)).all()
+    storage = ObjectStorage()
+    for asset in visual_assets:
+        if asset.object_key:
+            try:
+                storage.remove_object(asset.object_key)
+            except Exception:
+                logger.warning("Visual asset cleanup skipped for %s", asset.object_key, exc_info=True)
     db.query(Chunk).filter(Chunk.document_id == document.id).delete()
     db.query(RetrievalChunkCache).filter(RetrievalChunkCache.document_id == document.id).delete()
+    db.query(VisualAssetCache).filter(VisualAssetCache.document_id == document.id).delete()
     write_audit(
         db,
         current_user,
@@ -1306,7 +1334,15 @@ def run_evaluation_dataset(
         db.commit()
         db.refresh(run)
         return _evaluation_run_out(db, run)
-    totals = {"recall": 0.0, "mrr": 0.0, "ndcg": 0.0, "citation_readability": 0.0}
+    totals = {
+        "recall": 0.0,
+        "mrr": 0.0,
+        "ndcg": 0.0,
+        "citation_readability": 0.0,
+        "evidence_pollution_rate": 0.0,
+        "toc_over_rank_rate": 0.0,
+        "figure_hit_rate": 0.0,
+    }
     failures: list[dict] = []
     for case in cases:
         try:
@@ -1322,6 +1358,9 @@ def run_evaluation_dataset(
             expected_ids = case.expected_chunk_ids or []
             metrics = retrieval_metrics(retrieved_ids, expected_ids, k=int(run.strategy.get("top_k") or 10))
             readability = citation_readability_rate(citations)
+            pollution = evidence_pollution_rate(citations, question=case.question)
+            toc_rate = toc_over_rank_rate(citations, top_k=min(int(run.strategy.get("top_k") or 10), 5))
+            figure_hit = figure_hit_rate(case.question, citations, top_k=min(int(run.strategy.get("top_k") or 10), 5))
             case_metrics = {
                 "recall_at_k": metrics.recall_at_k,
                 "precision_at_k": metrics.precision_at_k,
@@ -1330,8 +1369,14 @@ def run_evaluation_dataset(
                 "hit": metrics.hit,
                 "faithfulness": readability if citations else 0.0,
                 "citation_readability": readability,
+                "evidence_pollution_rate": pollution,
+                "toc_over_rank_rate": toc_rate,
+                "figure_hit_rate": figure_hit,
             }
-            passed = bool(metrics.hit) if expected_ids else bool(citations and readability >= 0.8)
+            passed = (
+                bool(metrics.hit) if expected_ids
+                else bool(citations and readability >= 0.8 and pollution == 0.0 and toc_rate < 0.6 and figure_hit >= 1.0)
+            )
             if not passed:
                 failures.append({"case_id": case.id, "question": case.question, "metrics": case_metrics})
             db.add(
@@ -1351,6 +1396,9 @@ def run_evaluation_dataset(
             totals["mrr"] += metrics.mrr
             totals["ndcg"] += metrics.ndcg_at_k
             totals["citation_readability"] += readability
+            totals["evidence_pollution_rate"] += pollution
+            totals["toc_over_rank_rate"] += toc_rate
+            totals["figure_hit_rate"] += figure_hit
         except Exception as exc:
             failures.append({"case_id": case.id, "question": case.question, "error": str(exc)})
             db.add(
@@ -1373,6 +1421,9 @@ def run_evaluation_dataset(
         "ndcg_at_k": totals["ndcg"] / total if total else 0.0,
         "faithfulness": totals["citation_readability"] / total if total else 0.0,
         "citation_readability": totals["citation_readability"] / total if total else 0.0,
+        "evidence_pollution_rate": totals["evidence_pollution_rate"] / total if total else 0.0,
+        "toc_over_rank_rate": totals["toc_over_rank_rate"] / total if total else 0.0,
+        "figure_hit_rate": totals["figure_hit_rate"] / total if total else 0.0,
         "failure_count": len(failures),
         "failures": failures[:20],
     }
@@ -1882,6 +1933,7 @@ def _ingest_with_ragflow_or_local(
             data,
             content_type,
         )
+        visual_asset_payloads = parser_metadata.pop("_visual_asset_payloads", [])
         uploaded = client.upload_document(dataset_id, ragflow_filename, ragflow_data, ragflow_content_type)
         ragflow_doc_id = str(uploaded.get("id") or "")
         if not ragflow_doc_id or not _ragflow_document_belongs_to_dataset(client, dataset_id, ragflow_doc_id):
@@ -1898,6 +1950,11 @@ def _ingest_with_ragflow_or_local(
             "ragflow_content_type": ragflow_content_type,
             **parser_metadata,
             "ragflow_document": uploaded,
+        }
+        visual_asset_count = sync_visual_assets(db, document, visual_asset_payloads)
+        document.metadata_ = {
+            **(document.metadata_ or {}),
+            "visual_asset_cache_count": visual_asset_count,
         }
         db.commit()
 

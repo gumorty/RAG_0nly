@@ -101,9 +101,81 @@ def unsupported_claim_heuristic(answer: str, citations: list[dict[str, Any]]) ->
     }
 
 
+def evidence_pollution_rate(
+    citations: list[dict[str, Any]],
+    *,
+    question: str = "",
+    pollution_terms: list[str] | None = None,
+) -> float:
+    """Detect domain-specific evidence leaking into unrelated questions."""
+    if not citations:
+        return 0.0
+    pollution_terms = pollution_terms or ["住宿费", "旺季", "上浮", "相邻地区", "司局级", "部级"]
+    question_text = question or ""
+    if any(term in question_text for term in pollution_terms):
+        return 0.0
+    polluted = 0
+    for citation in citations:
+        text = " ".join(str(citation.get(key) or "") for key in ("preview", "content", "text"))
+        if any(term in text for term in pollution_terms):
+            polluted += 1
+    return polluted / len(citations)
+
+
+def toc_over_rank_rate(citations: list[dict[str, Any]], *, top_k: int = 5) -> float:
+    if not citations:
+        return 0.0
+    considered = citations[:top_k]
+    toc_like = 0
+    for citation in considered:
+        text = " ".join(str(citation.get(key) or "") for key in ("title", "preview", "content"))
+        compact = text.replace(" ", "")
+        if "图表检索索引" in compact:
+            continue
+        if re.search(r"目录|图目录|图目\s*录|\.{3,}\s*\d{1,4}", compact):
+            toc_like += 1
+    return toc_like / max(len(considered), 1)
+
+
+def figure_hit_rate(question: str, citations: list[dict[str, Any]], *, top_k: int = 5) -> float:
+    if not _looks_like_figure_question(question):
+        return 1.0
+    if not citations:
+        return 0.0
+    expected_no = _extract_figure_no(question)
+    expected_page = _extract_page_hint(question)
+    for citation in citations[:top_k]:
+        text = " ".join(str(citation.get(key) or "") for key in ("title", "preview", "content"))
+        compact = text.replace(" ", "")
+        if "图表检索索引" in compact:
+            if expected_no and expected_no in compact:
+                return 1.0
+            if expected_page and expected_page in compact:
+                return 1.0
+            if not expected_no and not expected_page:
+                return 1.0
+        if expected_no and expected_no in compact and not re.search(r"目录|图目录|图目\s*录", compact):
+            return 1.0
+    return 0.0
+
+
 def _ndcg(retrieved: list[str], expected: set[str], k: int) -> float:
     gains = [1.0 if item in expected else 0.0 for item in retrieved[:k]]
     dcg = sum(gain / math.log2(index + 2) for index, gain in enumerate(gains))
     ideal_len = min(len(expected), k)
     idcg = sum(1.0 / math.log2(index + 2) for index in range(ideal_len))
     return dcg / idcg if idcg else 0.0
+
+
+def _looks_like_figure_question(question: str) -> bool:
+    return bool(re.search(r"图|图表|图片|Figure|第\s*\d+\s*页|页码", question or "", flags=re.IGNORECASE))
+
+
+def _extract_figure_no(question: str) -> str:
+    match = re.search(r"(图\s*[一二三四五六七八九十百\d]+(?:[-.]\d+)?|Figure\s*\d+(?:[-.]\d+)?)", question or "", flags=re.IGNORECASE)
+    return re.sub(r"\s+", "", match.group(1)) if match else ""
+
+
+def _extract_page_hint(question: str) -> str:
+    match = re.search(r"(?:第\s*)?(\d{1,4})\s*页", question or "")
+    return f"第{match.group(1)}页" if match else ""

@@ -3,8 +3,10 @@ from pathlib import Path
 from app.core.config import get_settings
 from app.services.document_normalize import normalize_for_ragflow
 from app.services.document_quality import score_ingest_candidate, score_parsed_text
+from app.services.figure_index import augment_markdown_with_figure_index
 from app.services.mineru import MinerUClient, MinerUError
 from app.services.table_index import augment_markdown_with_table_index
+from app.services.visual_assets import augment_markdown_with_visual_assets
 
 
 MINERU_CANDIDATE_EXTENSIONS = {
@@ -29,7 +31,11 @@ def prepare_for_ragflow(
     if decision["engine"] == "mineru_precise":
         try:
             result = MinerUClient().parse_file(filename, data, data_id=document_id)
-            markdown_data, table_index_meta = _augment_markdown_if_enabled(result.markdown.encode("utf-8"))
+            visual_markdown, visual_meta, visual_payloads = augment_markdown_with_visual_assets(
+                result.markdown,
+                getattr(result, "artifacts", []) or [],
+            )
+            markdown_data, augment_meta = _augment_markdown_if_enabled(visual_markdown.encode("utf-8"))
             markdown = markdown_data.decode("utf-8", errors="replace")
             parsed_quality = score_parsed_text(markdown, "mineru_precise")
             metadata = {
@@ -39,21 +45,23 @@ def prepare_for_ragflow(
                 "parsed_quality": parsed_quality,
                 "normalized_for_ragflow": True,
                 "normalizer": "mineru",
-                "table_index": table_index_meta,
+                **augment_meta,
+                **visual_meta,
+                "_visual_asset_payloads": visual_payloads,
                 **result.metadata,
             }
             return f"{filename}.mineru.md", markdown_data, "text/markdown", metadata
         except MinerUError as exc:
             fallback_name, fallback_data, fallback_type, fallback_meta = normalize_for_ragflow(filename, data, content_type)
-            table_index_meta: dict = {}
+            augment_meta: dict = {}
             if fallback_type == "text/markdown":
-                fallback_data, table_index_meta = _augment_markdown_if_enabled(fallback_data)
+                fallback_data, augment_meta = _augment_markdown_if_enabled(fallback_data)
             metadata = {
                 "parser_engine": "ragflow_fallback_after_mineru",
                 "parser_decision": decision,
                 "raw_quality": raw_quality,
                 "parser_warning": str(exc),
-                "table_index": table_index_meta,
+                **augment_meta,
                 **fallback_meta,
             }
             if fallback_type == "text/markdown":
@@ -69,22 +77,27 @@ def prepare_for_ragflow(
         **normalization,
     }
     if normalized_type == "text/markdown":
-        normalized_data, table_index_meta = _augment_markdown_if_enabled(normalized_data)
-        metadata["table_index"] = table_index_meta
+        normalized_data, augment_meta = _augment_markdown_if_enabled(normalized_data)
+        metadata.update(augment_meta)
         metadata["parsed_quality"] = score_parsed_text(normalized_data.decode("utf-8", errors="replace"), parser_engine)
     return normalized_name, normalized_data, normalized_type, metadata
 
 
 def _augment_markdown_if_enabled(data: bytes) -> tuple[bytes, dict]:
     settings = get_settings()
-    if not getattr(settings, "table_row_index_enabled", False):
-        return data, {}
     markdown = data.decode("utf-8", errors="replace")
-    indexed = augment_markdown_with_table_index(
-        markdown,
-        max_rows=getattr(settings, "table_row_index_max_rows", 5000),
-    )
-    return indexed.markdown.encode("utf-8"), indexed.metadata
+    metadata: dict = {}
+    if getattr(settings, "table_row_index_enabled", False):
+        indexed = augment_markdown_with_table_index(
+            markdown,
+            max_rows=getattr(settings, "table_row_index_max_rows", 5000),
+        )
+        markdown = indexed.markdown
+        metadata["table_index"] = indexed.metadata
+    figure_indexed = augment_markdown_with_figure_index(markdown)
+    markdown = figure_indexed.markdown
+    metadata["figure_index"] = figure_indexed.metadata
+    return markdown.encode("utf-8"), metadata
 
 
 def _select_parser_engine(filename: str, data: bytes, content_type: str | None) -> dict:

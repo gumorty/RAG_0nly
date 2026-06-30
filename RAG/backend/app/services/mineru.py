@@ -1,7 +1,9 @@
 import io
+import json
+import mimetypes
 import time
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +20,7 @@ class MinerUError(RuntimeError):
 class MinerUParseResult:
     markdown: str
     metadata: dict[str, Any]
+    artifacts: list[dict[str, Any]] = field(default_factory=list)
 
 
 class MinerUClient:
@@ -80,7 +83,7 @@ class MinerUClient:
         zip_url = result.get("full_zip_url")
         if not zip_url:
             raise MinerUError("MinerU completed without full_zip_url")
-        markdown = self._download_full_markdown(str(zip_url))
+        markdown, artifact_metadata, artifacts = self._download_full_markdown(str(zip_url))
         return MinerUParseResult(
             markdown=markdown,
             metadata={
@@ -88,8 +91,10 @@ class MinerUClient:
                 "mineru_state": result.get("state"),
                 "mineru_model_version": model_version,
                 "mineru_result_zip_available": True,
+                **artifact_metadata,
                 "mineru_trace": _safe_trace(result),
             },
+            artifacts=artifacts,
         )
 
     def _wait_for_batch(self, batch_id: str) -> dict:
@@ -109,7 +114,7 @@ class MinerUClient:
             time.sleep(self.settings.mineru_poll_interval_seconds)
         raise MinerUError(f"MinerU parsing timed out; last_result={last_result}")
 
-    def _download_full_markdown(self, zip_url: str) -> str:
+    def _download_full_markdown(self, zip_url: str) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
         try:
             with httpx.Client(timeout=180, follow_redirects=True) as client:
                 response = client.get(zip_url)
@@ -124,7 +129,9 @@ class MinerUClient:
                 markdown_name = preferred[0] if preferred else next((name for name in names if name.endswith(".md")), None)
                 if not markdown_name:
                     raise MinerUError("MinerU result zip does not contain Markdown")
-                return archive.read(markdown_name).decode("utf-8", errors="replace")
+                metadata = _artifact_metadata(names, markdown_name)
+                artifacts = _extract_indexable_artifacts(archive, names, self.settings)
+                return archive.read(markdown_name).decode("utf-8", errors="replace"), metadata, artifacts
         except zipfile.BadZipFile as exc:
             raise MinerUError("MinerU result zip is invalid") from exc
         except KeyError as exc:
@@ -169,3 +176,110 @@ class MinerUClient:
 
 def _safe_trace(result: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in result.items() if key != "full_zip_url"}
+
+
+def _artifact_metadata(names: list[str], markdown_name: str) -> dict[str, Any]:
+    image_exts = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff")
+    json_files = [name for name in names if name.lower().endswith(".json")]
+    image_files = [name for name in names if name.lower().endswith(image_exts)]
+    table_files = [
+        name for name in names
+        if any(marker in name.lower() for marker in ("table", "tables", "layout", "middle"))
+    ]
+    return {
+        "mineru_markdown_file": markdown_name,
+        "mineru_artifact_count": len(names),
+        "mineru_image_count": len(image_files),
+        "mineru_json_count": len(json_files),
+        "mineru_table_artifact_count": len(table_files),
+        "mineru_image_files_sample": image_files[:20],
+        "mineru_json_files_sample": json_files[:20],
+        "mineru_table_files_sample": table_files[:20],
+    }
+
+
+def _extract_indexable_artifacts(archive: zipfile.ZipFile, names: list[str], settings: Any) -> list[dict[str, Any]]:
+    artifacts: list[dict[str, Any]] = []
+    max_images = int(getattr(settings, "visual_asset_max_images", 40) or 0)
+    max_image_bytes = int(getattr(settings, "visual_asset_max_image_mb", 8) or 8) * 1024 * 1024
+    max_json_chars = int(getattr(settings, "visual_asset_max_json_chars", 120000) or 120000)
+    image_exts = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff")
+    image_count = 0
+    for name in names:
+        lower = name.lower()
+        if lower.endswith(image_exts):
+            if image_count >= max_images:
+                continue
+            info = archive.getinfo(name)
+            if info.file_size > max_image_bytes:
+                continue
+            data = archive.read(name)
+            artifacts.append(
+                {
+                    "kind": "image",
+                    "name": name,
+                    "filename": Path(name).name,
+                    "content_type": mimetypes.guess_type(name)[0] or "application/octet-stream",
+                    "size": len(data),
+                    "data": data,
+                }
+            )
+            image_count += 1
+            continue
+        if lower.endswith(".json"):
+            try:
+                raw = archive.read(name)
+                text = raw.decode("utf-8", errors="replace")
+                snippet = _json_text_snippet(text, max_chars=max_json_chars)
+            except Exception:
+                snippet = ""
+            if snippet:
+                artifacts.append(
+                    {
+                        "kind": "json",
+                        "name": name,
+                        "filename": Path(name).name,
+                        "content_type": "application/json",
+                        "size": len(snippet.encode("utf-8", errors="ignore")),
+                        "text": snippet,
+                    }
+                )
+    return artifacts
+
+
+def _json_text_snippet(text: str, max_chars: int) -> str:
+    try:
+        payload = json.loads(text)
+    except ValueError:
+        return text[:max_chars]
+    strings: list[str] = []
+
+    def walk(value: Any) -> None:
+        if len(" ".join(strings)) >= max_chars:
+            return
+        if isinstance(value, str):
+            cleaned = " ".join(value.split())
+            if len(cleaned) >= 2:
+                strings.append(cleaned)
+        elif isinstance(value, list):
+            for item in value[:2000]:
+                walk(item)
+        elif isinstance(value, dict):
+            for key, item in list(value.items())[:2000]:
+                if isinstance(key, str) and key in {"text", "content", "caption", "html", "latex", "type", "page", "page_no"}:
+                    walk(item)
+                elif key in {"blocks", "lines", "spans", "tables", "figures", "images", "cells"}:
+                    walk(item)
+
+    walk(payload)
+    return "\n".join(_dedupe(strings))[:max_chars]
+
+
+def _dedupe(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in items:
+        if item and item not in seen:
+            seen.add(item)
+            result.append(item)
+    return result
